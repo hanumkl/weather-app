@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Weather Intelligence — Lakebase Vector Search</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #181b25;
+      --surface-2: #1f232f;
+      --border: #2a2f3d;
+      --text: #e6e8ee;
+      --muted: #9aa1b1;
+      --accent: #4f8cff;
+      --accent-hover: #3d7bf0;
+      --alert: #ff6b5b;
+      --forecast: #35c48f;
+      --radius: 10px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+
+    .wrap { max-width: 900px; margin: 0 auto; padding: 40px 24px 80px; }
+
+    header { margin-bottom: 32px; }
+    h1 { font-size: 26px; margin: 0 0 6px; letter-spacing: -0.3px; }
+    .subtitle { color: var(--muted); font-size: 14px; margin: 0; }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 22px;
+      margin-bottom: 20px;
+    }
+
+    .card h2 {
+      font-size: 15px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: var(--muted);
+      margin: 0 0 4px;
+      font-weight: 600;
+    }
+    .card .hint { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+
+    input[type="text"], select, textarea {
+      width: 100%;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-family: inherit;
+    }
+    input[type="text"]:focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+    .row > div { flex: 1; min-width: 140px; }
+
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 11px 20px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    button:hover:not(:disabled) { background: var(--accent-hover); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+    .chip {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 5px 11px;
+      border-radius: 999px;
+      font-size: 12px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .chip:hover { border-color: var(--accent); color: var(--text); }
+    .chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+    .checkbox-row { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
+    .checkbox-row label { margin: 0; font-size: 13px; }
+
+    .out { margin-top: 16px; }
+
+    .status {
+      font-size: 13px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      margin-bottom: 14px;
+    }
+    .status.ok { background: rgba(53,196,143,0.12); color: var(--forecast); }
+    .status.err { background: rgba(255,107,91,0.12); color: var(--alert); }
+    .status.info { background: rgba(79,140,255,0.12); color: var(--accent); }
+
+    .result {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin-bottom: 10px;
+    }
+    .result-top {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+    .badge {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-weight: 700;
+    }
+    .badge.alert { background: rgba(255,107,91,0.18); color: var(--alert); }
+    .badge.forecast { background: rgba(53,196,143,0.18); color: var(--forecast); }
+    .loc { font-weight: 600; font-size: 14px; }
+    .sim { margin-left: auto; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .headline { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+    .chunk { font-size: 13px; color: var(--text); }
+
+    .summary {
+      background: rgba(79,140,255,0.08);
+      border-left: 3px solid var(--accent);
+      padding: 14px 16px;
+      border-radius: 6px;
+      margin-bottom: 16px;
+      font-size: 14px;
+    }
+    .summary strong { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--accent); margin-bottom: 6px; }
+
+    .steps { font-size: 13px; color: var(--muted); }
+    .steps li { margin-bottom: 6px; }
+    code {
+      background: var(--surface-2);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 12px;
+      color: var(--accent);
+    }
+    .spin { display: inline-block; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Weather Intelligence</h1>
+    <p class="subtitle">NWS narrative text → Lakebase pgvector → semantic search</p>
+  </header>
+
+  <!-- STEP 1: SYNC -->
+  <div class="card">
+    <h2>Step 1 — Sync weather documents</h2>
+    <p class="hint">Harvests active alerts and forecast narratives from api.weather.gov into <code>weather_documents</code>.</p>
+
+    <label>Pick locations</label>
+    <div class="chips" id="cityChips"></div>
+
+    <div class="row">
+      <div>
+        <label for="limit">Max docs per location</label>
+        <input type="text" id="limit" value="50">
+      </div>
+    </div>
+
+    <button id="syncBtn" onclick="doSync()">Run sync</button>
+    <div class="out" id="syncOut"></div>
+  </div>
+
+  <!-- STEP 2: EMBED (notebook) -->
+  <div class="card">
+    <h2>Step 2 — Embed (run on a cluster)</h2>
+    <p class="hint">
+      The embedding model needs a cluster. Open
+      <code>notebooks/ingest_weather_embeddings.py</code> in your Databricks Git folder,
+      attach it to a cluster, and click <strong>Run All</strong>.
+    </p>
+    <button onclick="checkDocs()">Check synced document count</button>
+    <div class="out" id="docsOut"></div>
+  </div>
+
+  <!-- STEP 3: SEARCH -->
+  <div class="card">
+    <h2>Step 3 — Semantic search</h2>
+    <p class="hint">Cosine similarity over <code>weather_embeddings</code> using pgvector's <code>&lt;=&gt;</code> operator.</p>
+
+    <div style="margin-bottom:14px">
+      <label for="query">Query</label>
+      <input type="text" id="query" value="flash flood risk this weekend"
+             onkeydown="if(event.key==='Enter')doSearch()">
+    </div>
+
+    <div class="row">
+      <div>
+        <label for="topk">Top K</label>
+        <input type="text" id="topk" value="5">
+      </div>
+      <div>
+        <label for="stype">Filter by source</label>
+        <select id="stype">
+          <option value="">All</option>
+          <option value="alert">Alerts only</option>
+          <option value="forecast">Forecasts only</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="checkbox-row">
+      <input type="checkbox" id="summarize">
+      <label for="summarize">Include LLM summary (RAG)</label>
+    </div>
+
+    <button id="searchBtn" onclick="doSearch()">Search</button>
+    <div class="out" id="searchOut"></div>
+  </div>
+</div>
+
+<script>
+const CITIES = {{ cities|tojson }};
+const selected = new Set(["Chicago, IL", "Austin, TX", "Seattle, WA"]);
+
+function renderChips() {
+  const el = document.getElementById("cityChips");
+  el.innerHTML = "";
+  CITIES.forEach(city => {
+    const chip = document.createElement("div");
+    chip.className = "chip" + (selected.has(city) ? " on" : "");
+    chip.textContent = city;
+    chip.onclick = () => {
+      selected.has(city) ? selected.delete(city) : selected.add(city);
+      renderChips();
+    };
+    el.appendChild(chip);
+  });
+}
+renderChips();
+
+function setStatus(elId, kind, msg) {
+  document.getElementById(elId).innerHTML =
+    `<div class="status ${kind}">${msg}</div>`;
+}
+
+async function doSync() {
+  const btn = document.getElementById("syncBtn");
+  const locations = [...selected];
+  if (!locations.length) {
+    setStatus("syncOut", "err", "Pick at least one location.");
+    return;
+  }
+  btn.disabled = true;
+  setStatus("syncOut", "info", '<span class="spin">◠</span> Fetching from api.weather.gov…');
+  try {
+    const res = await fetch("weather/sync", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ locations, limit: parseInt(document.getElementById("limit").value) || 50 })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    setStatus("syncOut", "ok",
+      `Synced <strong>${data.synced}</strong> documents from ${data.locations.length} location(s). ` +
+      `Now run the embedding notebook (Step 2).`);
+  } catch (e) {
+    setStatus("syncOut", "err", `Sync failed: ${e.message}`);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function checkDocs() {
+  setStatus("docsOut", "info", '<span class="spin">◠</span> Checking…');
+  try {
+    const res = await fetch("weather/documents?limit=200");
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    const alerts = data.filter(d => d.source_type === "alert").length;
+    const forecasts = data.filter(d => d.source_type === "forecast").length;
+    setStatus("docsOut", "ok",
+      `<strong>${data.length}</strong> documents in Lakebase — ` +
+      `${alerts} alert(s), ${forecasts} forecast(s).`);
+  } catch (e) {
+    setStatus("docsOut", "err", `Failed: ${e.message}`);
+  }
+}
+
+async function doSearch() {
+  const btn = document.getElementById("searchBtn");
+  const query = document.getElementById("query").value.trim();
+  if (!query) {
+    setStatus("searchOut", "err", "Enter a query.");
+    return;
+  }
+  btn.disabled = true;
+  setStatus("searchOut", "info", '<span class="spin">◠</span> Embedding query and searching…');
+
+  const body = {
+    query,
+    top_k: parseInt(document.getElementById("topk").value) || 5
+  };
+  const stype = document.getElementById("stype").value;
+  if (stype) body.source_type = stype;
+  const wantSummary = document.getElementById("summarize").checked;
+
+  try {
+    let data;
+    if (wantSummary) {
+      const params = new URLSearchParams({
+        query, top_k: body.top_k, summarize: "true"
+      });
+      if (stype) params.set("source_type", stype);
+      const res = await fetch("weather/search?" + params.toString());
+      data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    } else {
+      const res = await fetch("weather/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      data = await res.json();
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    }
+
+    const out = document.getElementById("searchOut");
+
+    if (data.message) {
+      setStatus("searchOut", "err", data.message);
+      return;
+    }
+    if (!data.results || !data.results.length) {
+      setStatus("searchOut", "err", "No results found.");
+      return;
+    }
+
+    let html = `<div class="status ok">Found ${data.results.length} match(es)</div>`;
+
+    if (data.summary) {
+      html += `<div class="summary"><strong>Summary</strong>${escapeHtml(data.summary)}</div>`;
+    }
+
+    data.results.forEach(r => {
+      const pct = r.similarity != null ? (r.similarity * 100).toFixed(1) + "%" : "—";
+      html += `
+        <div class="result">
+          <div class="result-top">
+            <span class="badge ${r.source_type}">${r.source_type}</span>
+            <span class="loc">${escapeHtml(r.location)}</span>
+            <span class="sim">similarity ${pct}</span>
+          </div>
+          <div class="headline">${escapeHtml(r.headline || "")}</div>
+          <div class="chunk">${escapeHtml(r.chunk_text || "")}</div>
+        </div>`;
+    });
+
+    out.innerHTML = html;
+  } catch (e) {
+    setStatus("searchOut", "err", `Search failed: ${e.message}`);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = s;
+  return d.innerHTML;
+}
+</script>
+</body>
+</html>

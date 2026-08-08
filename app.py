@@ -17,11 +17,11 @@ import logging
 import os
 from typing import Any
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template, request
 
 import lakebase
 from embeddings import embed_query, vector_literal, warm_model
-from weather_client import WeatherClient, resolve_location
+from weather_client import CITY_COORDS, WeatherClient, resolve_location
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("weather-app")
@@ -68,6 +68,13 @@ def handle_exception(err):
 
 @app.route("/")
 def index():
+    """Browser UI for running the sync → embed → search pipeline."""
+    cities = sorted({display for _, _, display in CITY_COORDS.values()})
+    return render_template("index.html", cities=cities)
+
+
+@app.route("/api")
+def api_index():
     return jsonify(
         {
             "service": "weather-intelligence",

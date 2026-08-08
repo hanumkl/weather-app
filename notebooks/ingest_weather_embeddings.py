@@ -16,8 +16,22 @@
 
 # COMMAND ----------
 
-# DBTITLE 1,Install required packages
-# MAGIC %pip install sentence-transformers psycopg2-binary requests
+# MAGIC %md
+# MAGIC ## Install packages
+# MAGIC
+# MAGIC Uninstall `psycopg2` / `psycopg2-binary` first — the Databricks runtime already
+# MAGIC ships psycopg2, and having a pip-installed copy alongside it crashes the kernel
+# MAGIC ("Fatal error: The Python kernel is unresponsive").
+
+# COMMAND ----------
+
+# DBTITLE 1,Remove conflicting psycopg2 installs
+# MAGIC %pip uninstall -y psycopg2 psycopg2-binary
+
+# COMMAND ----------
+
+# DBTITLE 1,Install embedding dependencies
+# MAGIC %pip install -q sentence-transformers requests
 
 # COMMAND ----------
 

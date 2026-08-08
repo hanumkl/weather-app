@@ -129,11 +129,16 @@ Expected response: `{"synced": 28, "locations": [...], "documents_fetched": 28}`
 1. In your Git folder, open `notebooks/ingest_weather_embeddings.py`.
 2. Attach it to a running cluster.
 3. **Run All** — it will:
-   - Install `sentence-transformers` and `psycopg2-binary`
+   - Uninstall `psycopg2` / `psycopg2-binary`, then install `sentence-transformers`
    - Read unembedded docs from `weather_documents`
    - Chunk and embed them (384-dim)
    - Write vectors into `weather_embeddings` via `execute_values` + `::vector`
    - Verify with a sample similarity query
+
+> **Why uninstall psycopg2?** The Databricks runtime already ships `psycopg2`.
+> A pip-installed copy alongside it crashes the kernel with
+> *"Fatal error: The Python kernel is unresponsive."* All three notebooks
+> uninstall it first and rely on the runtime's version.
 
 ### 7. Semantic search
 

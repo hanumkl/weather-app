@@ -7,7 +7,17 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install sentence-transformers psycopg2-binary
+# MAGIC %md
+# MAGIC Uninstall `psycopg2` / `psycopg2-binary` first — the Databricks runtime already
+# MAGIC ships psycopg2, and a pip-installed copy alongside it crashes the kernel.
+
+# COMMAND ----------
+
+# MAGIC %pip uninstall -y psycopg2 psycopg2-binary
+
+# COMMAND ----------
+
+# MAGIC %pip install -q sentence-transformers
 
 # COMMAND ----------
 

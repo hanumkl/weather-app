@@ -9,3 +9,15 @@ env:
     value: "lakebase-url"
   - name: NWS_USER_AGENT
     value: "weather-app-bootcamp (student@example.com)"
+
+  # Chat model used for the GET /weather/search RAG summary.
+  # Check GET /diagnostics for endpoint names this app can actually see,
+  # then set the exact name here. Falls back to an extractive summary if
+  # the endpoint is missing or not queryable.
+  - name: DATABRICKS_LLM_ENDPOINT
+    value: "databricks-meta-llama-3-3-70b-instruct"
+
+  # Embedding model used to embed the search query inside the app
+  # (the notebook uses local sentence-transformers instead).
+  - name: DATABRICKS_EMBEDDING_ENDPOINT
+    value: "databricks-bge-large-en"

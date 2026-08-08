@@ -80,6 +80,7 @@ def api_index():
             "service": "weather-intelligence",
             "endpoints": {
                 "GET /healthz": "health check",
+                "GET /diagnostics": "config + serving endpoints this app can see",
                 "POST /weather/sync": "harvest NWS alerts+forecasts into Lakebase",
                 "POST /weather/search": "semantic search over weather_embeddings",
                 "GET /weather/search": "search + optional LLM summary (RAG)",
@@ -87,6 +88,45 @@ def api_index():
             },
         }
     )
+
+
+@app.route("/diagnostics")
+def diagnostics():
+    """
+    Report which model serving endpoints this app's service principal can see.
+
+    Useful for picking a value for DATABRICKS_LLM_ENDPOINT: the app runs as its
+    own service principal, so it may see a different set than you do in the UI.
+    """
+    configured_llm = os.environ.get(
+        "DATABRICKS_LLM_ENDPOINT", "databricks-meta-llama-3-3-70b-instruct"
+    )
+    info: dict[str, Any] = {
+        "configured_llm_endpoint": configured_llm,
+        "configured_embedding_endpoint": os.environ.get(
+            "DATABRICKS_EMBEDDING_ENDPOINT", "databricks-bge-large-en"
+        ),
+    }
+
+    try:
+        from databricks.sdk import WorkspaceClient
+
+        w = WorkspaceClient()
+        names = sorted(ep.name for ep in w.serving_endpoints.list() if ep.name)
+        info["visible_serving_endpoints"] = names
+        info["configured_llm_is_visible"] = configured_llm in names
+        info["chat_like_endpoints"] = [
+            n
+            for n in names
+            if any(k in n.lower() for k in ("llama", "gpt", "claude", "mixtral", "dbrx", "qwen", "gemma"))
+        ]
+        info["embedding_like_endpoints"] = [
+            n for n in names if any(k in n.lower() for k in ("bge", "embed", "gte"))
+        ]
+    except Exception as exc:  # noqa: BLE001
+        info["error"] = f"Could not list serving endpoints: {exc}"
+
+    return jsonify(info)
 
 
 @app.route("/weather/documents")

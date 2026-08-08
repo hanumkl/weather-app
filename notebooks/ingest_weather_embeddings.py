@@ -62,6 +62,9 @@ dbutils.widgets.text("chunk_size", "800", "Chunk size (chars)")
 dbutils.widgets.text("chunk_overlap", "100", "Chunk overlap (chars)")
 dbutils.widgets.text("request_batch", "32", "Strings per embedding request")
 dbutils.widgets.text("max_workers", "1", "Parallel requests (keep 1 on pay-per-token)")
+dbutils.widgets.dropdown(
+    "allow_parallel", "false", ["false", "true"], "Allow parallel (provisioned throughput only)"
+)
 dbutils.widgets.text("sleep_between", "1.0", "Seconds to wait between requests")
 dbutils.widgets.text("request_timeout", "60", "Per-request timeout (seconds)")
 dbutils.widgets.text("max_documents", "0", "Cap documents per run (0 = no cap)")
@@ -78,6 +81,18 @@ SLEEP_BETWEEN = float(dbutils.widgets.get("sleep_between"))
 REQUEST_TIMEOUT = int(dbutils.widgets.get("request_timeout"))
 MAX_DOCUMENTS = int(dbutils.widgets.get("max_documents"))
 REBUILD_ALL = dbutils.widgets.get("rebuild_all") == "true"
+ALLOW_PARALLEL = dbutils.widgets.get("allow_parallel") == "true"
+
+# Widget values persist across runs, so an existing max_workers=8 survives even
+# after the default here changes. Parallel requests reliably trip the workspace
+# QPS limit on pay-per-token endpoints, so clamp unless explicitly opted in.
+if MAX_WORKERS > 1 and not ALLOW_PARALLEL:
+    print(
+        f"NOTE: max_workers={MAX_WORKERS} would trip the workspace QPS limit on a "
+        "pay-per-token endpoint. Forcing 1. Set allow_parallel=true only if this "
+        "endpoint has provisioned throughput."
+    )
+    MAX_WORKERS = 1
 
 # Known output sizes for Databricks Foundation Model embedding endpoints
 ENDPOINT_DIMS = {
@@ -91,6 +106,10 @@ if EMBEDDING_DIM is None:
         "to ENDPOINT_DIMS above before running."
     )
 
+# Bump when changing request/retry behaviour — makes stale notebook copies obvious
+CODE_VERSION = "2026-08-08-rate-limit-aware"
+
+print(f"Code version: {CODE_VERSION}")
 print(f"Endpoint: {EMBEDDING_ENDPOINT} -> {EMBEDDING_DIM}-dim vectors")
 print(f"Chunking: size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}")
 print(f"Tables: {DOCUMENTS_TABLE} -> {EMBEDDINGS_TABLE}")

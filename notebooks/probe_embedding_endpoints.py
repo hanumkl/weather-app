@@ -42,8 +42,11 @@ import time
 
 import requests
 
+# Must match the ingest notebook's embedding_endpoint widget
+CURRENT_ENDPOINT = "databricks-gte-large-en"
+
 # Anything that looks like an embedding model, plus known Databricks defaults
-KNOWN = ["databricks-gte-large-en", "databricks-bge-large-en"]
+KNOWN = [CURRENT_ENDPOINT, "databricks-bge-large-en"]
 candidates = sorted(
     {e.name for e in endpoints if any(k in e.name.lower() for k in ("embed", "gte", "bge"))}
     | set(KNOWN)
@@ -96,14 +99,26 @@ else:
     for name, dims in working:
         print(f"  {name}  ({dims}-dim)")
 
-    best, dims = working[0]
-    print(
-        f"\nTo switch to {best}:\n"
-        f"  1. Set the ingest notebook's embedding_endpoint widget to {best!r}.\n"
-        f"  2. Set DATABRICKS_EMBEDDING_ENDPOINT to {best!r} in app.yaml and redeploy.\n"
-        f"  3. Re-run the ingest notebook.\n\n"
-        f"Both steps matter: documents and queries must be embedded by the same\n"
-        f"model or similarity scores are meaningless. The ingest notebook drops and\n"
-        f"recreates the vector column automatically if the dimension changes\n"
-        f"(this endpoint returns {dims})."
-    )
+    usable_names = [name for name, _ in working]
+
+    # Switching endpoints means re-embedding everything, so only recommend it
+    # when the one already in use is actually unavailable.
+    if CURRENT_ENDPOINT in usable_names:
+        print(
+            f"\nYour configured endpoint ({CURRENT_ENDPOINT}) is working again.\n"
+            "Change nothing — just re-run the ingest notebook. Switching would "
+            "force a full re-embed and an app.yaml change for no benefit."
+        )
+    else:
+        best, dims = working[0]
+        print(
+            f"\nYour configured endpoint ({CURRENT_ENDPOINT}) is unavailable. "
+            f"To switch to {best}:\n"
+            f"  1. Set the ingest notebook's embedding_endpoint widget to {best!r}.\n"
+            f"  2. Set DATABRICKS_EMBEDDING_ENDPOINT to {best!r} in app.yaml, redeploy.\n"
+            f"  3. Re-run the ingest notebook.\n\n"
+            f"Both steps matter: documents and queries must be embedded by the same\n"
+            f"model or similarity scores are meaningless. The ingest notebook drops\n"
+            f"and recreates the vector column automatically if the dimension changes\n"
+            f"(this endpoint returns {dims})."
+        )

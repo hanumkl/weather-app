@@ -447,11 +447,22 @@ def embed_batch(texts, timeout=REQUEST_TIMEOUT, max_attempts=MAX_ATTEMPTS):
 
 # COMMAND ----------
 
-# DBTITLE 1,Smoke test one call (confirms endpoint + latency)
+# DBTITLE 1,Smoke test one call (fails fast on purpose)
+# No retries here: this call exists to answer "is the endpoint usable right now",
+# so waiting out the full backoff would just delay the answer by minutes.
 t0 = time.perf_counter()
-probe = embed_batch(["Sunny with a high near 78."])
-print(f"Single-call latency: {(time.perf_counter() - t0) * 1000:.0f} ms")
-print(f"Returned {len(probe[0])} dims from {EMBEDDING_ENDPOINT}")
+try:
+    probe = embed_batch(["Sunny with a high near 78."], max_attempts=1)
+    print(f"Single-call latency: {(time.perf_counter() - t0) * 1000:.0f} ms")
+    print(f"Returned {len(probe[0])} dims from {EMBEDDING_ENDPOINT}")
+except RuntimeError as exc:
+    print(
+        f"Endpoint not usable right now: {exc}\n\n"
+        "If this is REQUEST_LIMIT_EXCEEDED, the workspace's shared request budget "
+        "for this endpoint is exhausted. Run notebooks/probe_embedding_endpoints "
+        "to find one that responds. The cells below still run and will retry "
+        "patiently, committing whatever they manage to embed."
+    )
 
 # COMMAND ----------
 

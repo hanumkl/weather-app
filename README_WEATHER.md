@@ -231,9 +231,31 @@ Or create the job manually via **Workflows UI** → **Create Job** with two note
 | Search returns an error about dimensions | Endpoint output size ≠ `vector(N)` column. Align `EMBEDDING_DIM` and re-run the notebook |
 | RAG summary looks templated | The LLM call failed and fell back to extractive. Check `GET /diagnostics` → `llm_query_test` |
 | All similarity scores in a narrow band | Query and documents were embedded by different models — re-run the notebook |
+| Notebook: `TimeoutError: Timed out after 0:05:00` | `serving_endpoints.query()` retries internally for 5 min with no per-request timeout. Both notebook and app now call the REST `invocations` API with an explicit timeout |
+| `429 REQUEST_LIMIT_EXCEEDED` | Workspace QPS limit on pay-per-token endpoints. Keep `max_workers=1`, raise `request_batch`, raise `sleep_between`. See below |
 
 `GET /diagnostics` reports the configured endpoints, which ones this app can
 actually see, the live LLM test result, and the table's declared vector width.
+
+### Rate limits (important)
+
+Pay-per-token Foundation Model endpoints enforce a **workspace QPS limit**.
+Because the limit counts *queries per second* rather than tokens, throughput
+comes from **fewer, larger, spaced-out requests** — parallelism makes it worse.
+The notebook defaults reflect this:
+
+| Widget | Default | Why |
+|---|---|---|
+| `request_batch` | 32 | Many chunks per request → few requests total |
+| `max_workers` | 1 | Sequential. Raise only with a provisioned throughput endpoint |
+| `sleep_between` | 1.0 | Stays inside the per-second window |
+| `request_timeout` | 60 | Explicit, so a stuck call fails fast |
+
+On 429 the notebook backs off long (10s, 20s, 40s…) with jitter and honours
+`Retry-After`. Short 1–2s retries do not clear the window. If the endpoint
+rejects an oversized payload, the batch is split in half automatically.
+
+The app retries only briefly (3 attempts) since a user is waiting on the response.
 
 ## Known Limitations
 

@@ -61,12 +61,9 @@ dbutils.widgets.text("embedding_endpoint", "databricks-gte-large-en", "Embedding
 dbutils.widgets.text("chunk_size", "800", "Chunk size (chars)")
 dbutils.widgets.text("chunk_overlap", "100", "Chunk overlap (chars)")
 dbutils.widgets.text("request_batch", "32", "Strings per embedding request")
-dbutils.widgets.text("max_workers", "1", "Parallel requests (keep 1 on pay-per-token)")
-dbutils.widgets.dropdown(
-    "allow_parallel", "false", ["false", "true"], "Allow parallel (provisioned throughput only)"
-)
 dbutils.widgets.text("sleep_between", "1.0", "Seconds to wait between requests")
 dbutils.widgets.text("request_timeout", "60", "Per-request timeout (seconds)")
+dbutils.widgets.text("max_attempts", "8", "Attempts per request before giving up")
 dbutils.widgets.text("max_documents", "0", "Cap documents per run (0 = no cap)")
 dbutils.widgets.dropdown("rebuild_all", "false", ["false", "true"], "Re-embed everything")
 
@@ -76,23 +73,11 @@ EMBEDDING_ENDPOINT = dbutils.widgets.get("embedding_endpoint")
 CHUNK_SIZE = int(dbutils.widgets.get("chunk_size"))
 CHUNK_OVERLAP = int(dbutils.widgets.get("chunk_overlap"))
 REQUEST_BATCH = int(dbutils.widgets.get("request_batch"))
-MAX_WORKERS = int(dbutils.widgets.get("max_workers"))
 SLEEP_BETWEEN = float(dbutils.widgets.get("sleep_between"))
 REQUEST_TIMEOUT = int(dbutils.widgets.get("request_timeout"))
+MAX_ATTEMPTS = int(dbutils.widgets.get("max_attempts"))
 MAX_DOCUMENTS = int(dbutils.widgets.get("max_documents"))
 REBUILD_ALL = dbutils.widgets.get("rebuild_all") == "true"
-ALLOW_PARALLEL = dbutils.widgets.get("allow_parallel") == "true"
-
-# Widget values persist across runs, so an existing max_workers=8 survives even
-# after the default here changes. Parallel requests reliably trip the workspace
-# QPS limit on pay-per-token endpoints, so clamp unless explicitly opted in.
-if MAX_WORKERS > 1 and not ALLOW_PARALLEL:
-    print(
-        f"NOTE: max_workers={MAX_WORKERS} would trip the workspace QPS limit on a "
-        "pay-per-token endpoint. Forcing 1. Set allow_parallel=true only if this "
-        "endpoint has provisioned throughput."
-    )
-    MAX_WORKERS = 1
 
 # Known output sizes for Databricks Foundation Model embedding endpoints
 ENDPOINT_DIMS = {
@@ -113,8 +98,8 @@ print(f"Code version: {CODE_VERSION}")
 print(f"Endpoint: {EMBEDDING_ENDPOINT} -> {EMBEDDING_DIM}-dim vectors")
 print(f"Chunking: size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}")
 print(f"Tables: {DOCUMENTS_TABLE} -> {EMBEDDINGS_TABLE}")
-print(f"Requests: batch={REQUEST_BATCH}, workers={MAX_WORKERS}, "
-      f"sleep={SLEEP_BETWEEN}s, timeout={REQUEST_TIMEOUT}s")
+print(f"Requests: batch={REQUEST_BATCH}, sleep={SLEEP_BETWEEN}s, "
+      f"timeout={REQUEST_TIMEOUT}s, attempts={MAX_ATTEMPTS}")
 print(f"Rebuild all: {REBUILD_ALL}, max_documents: {MAX_DOCUMENTS or 'no cap'}")
 
 # COMMAND ----------
@@ -360,17 +345,20 @@ if chunk_rows:
 # MAGIC
 # MAGIC ### Rate limits
 # MAGIC
-# MAGIC Pay-per-token Foundation Model endpoints enforce a **workspace QPS limit**.
-# MAGIC Exceeding it returns `429 REQUEST_LIMIT_EXCEEDED`. Because the limit counts
-# MAGIC *queries*, not tokens, the strategy is **fewer, larger, spaced-out requests**
-# MAGIC rather than parallel ones:
+# MAGIC Pay-per-token Foundation Model endpoints share one **workspace-wide** request
+# MAGIC budget. Exceeding it returns `429 REQUEST_LIMIT_EXCEEDED`. Because the limit
+# MAGIC counts *requests* rather than tokens, throughput comes from **fewer, larger,
+# MAGIC spaced-out requests**, so everything here is deliberately sequential:
 # MAGIC
 # MAGIC - `request_batch=32` — many chunks per request, so few requests overall
-# MAGIC - `max_workers=1` — sequential; parallelism actively hurts here
-# MAGIC - `sleep_between=1.0` — stay under the per-second window
-# MAGIC - long exponential backoff with jitter, honouring `Retry-After`
+# MAGIC - `sleep_between=1.0` — stays inside the per-second window
+# MAGIC - backoff of 10s, 20s, 40s, capped at 60s, with jitter and `Retry-After`
+# MAGIC - batches are committed as they finish, so a 429 never loses earlier work
 # MAGIC
-# MAGIC Raise `max_workers` only if you have a **provisioned throughput** endpoint.
+# MAGIC There is intentionally no parallelism: concurrent requests only make a
+# MAGIC shared request budget run out sooner. If the budget is exhausted by other
+# MAGIC workspace activity, no client-side tuning helps — switch
+# MAGIC `embedding_endpoint` to a less contended endpoint or wait for capacity.
 
 # COMMAND ----------
 
@@ -425,7 +413,7 @@ def _post_embeddings(texts, timeout):
     raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
 
 
-def embed_batch(texts, timeout=REQUEST_TIMEOUT, max_attempts=6):
+def embed_batch(texts, timeout=REQUEST_TIMEOUT, max_attempts=MAX_ATTEMPTS):
     """
     Embed a list of strings, retrying through rate limits.
 
@@ -448,7 +436,9 @@ def embed_batch(texts, timeout=REQUEST_TIMEOUT, max_attempts=6):
 
         last_error = error
         if attempt < max_attempts - 1:
-            wait = retry_after if retry_after else 10 * (2 ** attempt)
+            # Cap the backoff: doubling past a minute just burns the notebook's
+            # time budget without improving the odds of the window clearing.
+            wait = retry_after if retry_after else min(60, 10 * (2 ** attempt))
             wait += random.uniform(0, 2)  # jitter so retries don't align
             print(f"    retry {attempt + 1}/{max_attempts - 1} in {wait:.1f}s ({last_error})")
             time.sleep(wait)
@@ -465,75 +455,26 @@ print(f"Returned {len(probe[0])} dims from {EMBEDDING_ENDPOINT}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Embed all chunks
-if len(chunk_rows) == 0:
-    print("No chunks to embed — run POST /weather/sync first!")
-    dbutils.notebook.exit("no_data")
-
-texts = [r["chunk_text"] for r in chunk_rows]
-batches = [texts[i : i + REQUEST_BATCH] for i in range(0, len(texts), REQUEST_BATCH)]
-print(f"Embedding {len(texts)} chunks in {len(batches)} batch(es), "
-      f"{MAX_WORKERS} worker(s), {SLEEP_BETWEEN}s between requests...")
-
-t0 = time.perf_counter()
-
-if MAX_WORKERS <= 1:
-    all_embeddings = []
-    for i, batch in enumerate(batches, start=1):
-        all_embeddings.extend(embed_batch(batch))
-        print(f"  batch {i}/{len(batches)} -> {len(all_embeddings)}/{len(texts)} chunks")
-        if i < len(batches) and SLEEP_BETWEEN > 0:
-            time.sleep(SLEEP_BETWEEN)
-else:
-    # Only sensible with provisioned throughput; map preserves input order
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        results = list(pool.map(embed_batch, batches))
-    all_embeddings = [vec for batch_vectors in results for vec in batch_vectors]
-
-elapsed = time.perf_counter() - t0
-
-if len(all_embeddings) != len(chunk_rows):
-    raise RuntimeError(
-        f"Embedding count mismatch: {len(all_embeddings)} vectors for {len(chunk_rows)} chunks"
-    )
-
-print(f"Computed {len(all_embeddings)} embeddings ({EMBEDDING_DIM}-dim) in {elapsed:.1f}s")
-
-# COMMAND ----------
-
 # MAGIC %md
-# MAGIC ## Upsert Embeddings into Lakebase
+# MAGIC ## Embed and Upsert, Batch by Batch
 # MAGIC
-# MAGIC `psycopg2.extras.execute_values` for batch throughput. Each embedding is
-# MAGIC cast to the Postgres `vector` type via `%s::vector`. `ON CONFLICT` makes
-# MAGIC re-runs idempotent.
+# MAGIC Each batch is written to Lakebase as soon as it is embedded, rather than
+# MAGIC embedding everything and writing once at the end. When the endpoint is
+# MAGIC throttled this is the difference between resumable and hopeless: a failure
+# MAGIC on batch 5 keeps batches 1-4, and because the document query above only
+# MAGIC selects rows that have no embedding yet, simply re-running the notebook
+# MAGIC picks up where it stopped.
+# MAGIC
+# MAGIC `execute_values` gives batch throughput, each vector is cast with
+# MAGIC `%s::vector`, and `ON CONFLICT` keeps re-runs idempotent.
 
 # COMMAND ----------
 
-# DBTITLE 1,Write embeddings via psycopg2
+# DBTITLE 1,Upsert helper
 from datetime import datetime, timezone
 from psycopg2.extras import execute_values
 
-now = datetime.now(timezone.utc).isoformat()
-
-insert_data = [
-    (
-        row["id"],
-        row["document_id"],
-        row["chunk_index"],
-        row["chunk_text"],
-        "[" + ",".join(str(float(x)) for x in vec) + "]",
-        EMBEDDING_ENDPOINT,
-        now,
-    )
-    for row, vec in zip(chunk_rows, all_embeddings)
-]
-
-print(f"Inserting {len(insert_data)} embeddings into {EMBEDDINGS_TABLE}...")
-
-insert_sql = f"""
+INSERT_SQL = f"""
     INSERT INTO {EMBEDDINGS_TABLE} (
         id, document_id, chunk_index, chunk_text, embedding, model_name, created_at
     ) VALUES %s
@@ -543,16 +484,79 @@ insert_sql = f"""
         model_name = EXCLUDED.model_name,
         created_at = EXCLUDED.created_at
 """
-template = "(%s, %s, %s, %s, %s::vector, %s, %s)"
+INSERT_TEMPLATE = "(%s, %s, %s, %s, %s::vector, %s, %s)"
 
-conn = get_conn()
-cur = conn.cursor()
-execute_values(cur, insert_sql, insert_data, template=template, page_size=100)
-conn.commit()
-cur.close()
-conn.close()
 
-print(f"Successfully upserted {len(insert_data)} embeddings into {EMBEDDINGS_TABLE}")
+def upsert_embeddings(rows, vectors):
+    """Write one batch of (row, vector) pairs. Commits so progress is durable."""
+    now = datetime.now(timezone.utc).isoformat()
+    payload = [
+        (
+            row["id"],
+            row["document_id"],
+            row["chunk_index"],
+            row["chunk_text"],
+            "[" + ",".join(str(float(x)) for x in vec) + "]",
+            EMBEDDING_ENDPOINT,
+            now,
+        )
+        for row, vec in zip(rows, vectors)
+    ]
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            execute_values(cur, INSERT_SQL, payload, template=INSERT_TEMPLATE, page_size=100)
+        conn.commit()
+    finally:
+        conn.close()
+
+    return len(payload)
+
+# COMMAND ----------
+
+# DBTITLE 1,Embed + upsert each batch (resumable)
+if len(chunk_rows) == 0:
+    print("No chunks to embed — run POST /weather/sync first!")
+    dbutils.notebook.exit("no_data")
+
+row_batches = [
+    chunk_rows[i : i + REQUEST_BATCH] for i in range(0, len(chunk_rows), REQUEST_BATCH)
+]
+print(f"Embedding {len(chunk_rows)} chunks in {len(row_batches)} batch(es), "
+      f"{SLEEP_BETWEEN}s between requests...")
+
+t0 = time.perf_counter()
+written = 0
+failed_batch = None
+
+for i, batch_rows in enumerate(row_batches, start=1):
+    try:
+        vectors = embed_batch([r["chunk_text"] for r in batch_rows])
+    except RuntimeError as exc:
+        # Keep what we already committed; report where to resume from
+        failed_batch = (i, str(exc))
+        break
+
+    written += upsert_embeddings(batch_rows, vectors)
+    print(f"  batch {i}/{len(row_batches)} embedded + written "
+          f"({written}/{len(chunk_rows)} chunks)")
+
+    if i < len(row_batches) and SLEEP_BETWEEN > 0:
+        time.sleep(SLEEP_BETWEEN)
+
+elapsed = time.perf_counter() - t0
+print(f"\nUpserted {written}/{len(chunk_rows)} embeddings "
+      f"({EMBEDDING_DIM}-dim) into {EMBEDDINGS_TABLE} in {elapsed:.1f}s")
+
+if failed_batch:
+    index, message = failed_batch
+    print(
+        f"\nStopped at batch {index}/{len(row_batches)}: {message}\n"
+        f"The {written} chunks already written are safe. Re-run this notebook to "
+        "resume from the remaining chunks once the endpoint has capacity, or "
+        "switch the embedding_endpoint widget to a less contended endpoint."
+    )
 
 # COMMAND ----------
 

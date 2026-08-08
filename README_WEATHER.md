@@ -232,6 +232,7 @@ Or create the job manually via **Workflows UI** → **Create Job** with two note
 | RAG summary looks templated | The LLM call failed and fell back to extractive. Check `GET /diagnostics` → `llm_query_test` |
 | All similarity scores in a narrow band | Query and documents were embedded by different models — re-run the notebook |
 | Notebook: `TimeoutError: Timed out after 0:05:00` | `serving_endpoints.query()` retries internally for 5 min with no per-request timeout. Both notebook and app now call the REST `invocations` API with an explicit timeout |
+| `permission denied for table weather_documents` | The connecting Postgres role is not the table owner. Changing the role in `database/lakebase-url` requires `ALTER TABLE ... OWNER TO "<role>"` first, run as the **old** owner. Ownership (not just `GRANT ALL`) is needed because the ingest notebook may drop and recreate the embeddings table during a dimension migration |
 | `429 REQUEST_LIMIT_EXCEEDED` | Shared workspace request budget for pay-per-token endpoints is saturated. Runs are resumable, so re-run to continue; or switch `embedding_endpoint`. See below |
 | Fix pushed to git but notebook behaves the same | Databricks runs its own copy. Pull in the Git folder, then `dbutils.widgets.removeAll()` + re-run cell 1, since **widget values persist and ignore new code defaults**. Check the `Code version:` line to confirm |
 

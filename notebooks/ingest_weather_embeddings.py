@@ -60,9 +60,13 @@ dbutils.widgets.text("embeddings_table", "weather_embeddings", "Destination tabl
 dbutils.widgets.text("embedding_endpoint", "databricks-gte-large-en", "Embedding endpoint")
 dbutils.widgets.text("chunk_size", "800", "Chunk size (chars)")
 dbutils.widgets.text("chunk_overlap", "100", "Chunk overlap (chars)")
-dbutils.widgets.text("request_batch", "16", "Strings per embedding request")
-dbutils.widgets.text("max_workers", "8", "Parallel embedding requests")
-dbutils.widgets.text("request_timeout", "30", "Per-request timeout (seconds)")
+dbutils.widgets.text("request_batch", "32", "Strings per embedding request")
+dbutils.widgets.text("max_workers", "1", "Parallel requests (keep 1 on pay-per-token)")
+dbutils.widgets.dropdown(
+    "allow_parallel", "false", ["false", "true"], "Allow parallel (provisioned throughput only)"
+)
+dbutils.widgets.text("sleep_between", "1.0", "Seconds to wait between requests")
+dbutils.widgets.text("request_timeout", "60", "Per-request timeout (seconds)")
 dbutils.widgets.text("max_documents", "0", "Cap documents per run (0 = no cap)")
 dbutils.widgets.dropdown("rebuild_all", "false", ["false", "true"], "Re-embed everything")
 
@@ -73,9 +77,22 @@ CHUNK_SIZE = int(dbutils.widgets.get("chunk_size"))
 CHUNK_OVERLAP = int(dbutils.widgets.get("chunk_overlap"))
 REQUEST_BATCH = int(dbutils.widgets.get("request_batch"))
 MAX_WORKERS = int(dbutils.widgets.get("max_workers"))
+SLEEP_BETWEEN = float(dbutils.widgets.get("sleep_between"))
 REQUEST_TIMEOUT = int(dbutils.widgets.get("request_timeout"))
 MAX_DOCUMENTS = int(dbutils.widgets.get("max_documents"))
 REBUILD_ALL = dbutils.widgets.get("rebuild_all") == "true"
+ALLOW_PARALLEL = dbutils.widgets.get("allow_parallel") == "true"
+
+# Widget values persist across runs, so an existing max_workers=8 survives even
+# after the default here changes. Parallel requests reliably trip the workspace
+# QPS limit on pay-per-token endpoints, so clamp unless explicitly opted in.
+if MAX_WORKERS > 1 and not ALLOW_PARALLEL:
+    print(
+        f"NOTE: max_workers={MAX_WORKERS} would trip the workspace QPS limit on a "
+        "pay-per-token endpoint. Forcing 1. Set allow_parallel=true only if this "
+        "endpoint has provisioned throughput."
+    )
+    MAX_WORKERS = 1
 
 # Known output sizes for Databricks Foundation Model embedding endpoints
 ENDPOINT_DIMS = {
@@ -89,10 +106,15 @@ if EMBEDDING_DIM is None:
         "to ENDPOINT_DIMS above before running."
     )
 
+# Bump when changing request/retry behaviour — makes stale notebook copies obvious
+CODE_VERSION = "2026-08-08-rate-limit-aware"
+
+print(f"Code version: {CODE_VERSION}")
 print(f"Endpoint: {EMBEDDING_ENDPOINT} -> {EMBEDDING_DIM}-dim vectors")
 print(f"Chunking: size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}")
 print(f"Tables: {DOCUMENTS_TABLE} -> {EMBEDDINGS_TABLE}")
-print(f"Requests: batch={REQUEST_BATCH}, workers={MAX_WORKERS}, timeout={REQUEST_TIMEOUT}s")
+print(f"Requests: batch={REQUEST_BATCH}, workers={MAX_WORKERS}, "
+      f"sleep={SLEEP_BETWEEN}s, timeout={REQUEST_TIMEOUT}s")
 print(f"Rebuild all: {REBUILD_ALL}, max_documents: {MAX_DOCUMENTS or 'no cap'}")
 
 # COMMAND ----------
@@ -332,15 +354,28 @@ if chunk_rows:
 # MAGIC ## Compute Embeddings
 # MAGIC
 # MAGIC Calls the endpoint's REST `invocations` API directly rather than through
-# MAGIC `serving_endpoints.query()`. The SDK retries internally for up to 5 minutes
-# MAGIC with no per-request timeout, so one slow call stalls the whole run and the
-# MAGIC cell dies with `TimeoutError: Timed out after 0:05:00`. Here each request
-# MAGIC has an explicit timeout, retries with backoff on 429/5xx, and batches run
-# MAGIC in parallel via `ThreadPoolExecutor`.
+# MAGIC `serving_endpoints.query()`, which retries internally for up to 5 minutes
+# MAGIC with no per-request timeout (that produces `TimeoutError: Timed out after
+# MAGIC 0:05:00`).
+# MAGIC
+# MAGIC ### Rate limits
+# MAGIC
+# MAGIC Pay-per-token Foundation Model endpoints enforce a **workspace QPS limit**.
+# MAGIC Exceeding it returns `429 REQUEST_LIMIT_EXCEEDED`. Because the limit counts
+# MAGIC *queries*, not tokens, the strategy is **fewer, larger, spaced-out requests**
+# MAGIC rather than parallel ones:
+# MAGIC
+# MAGIC - `request_batch=32` — many chunks per request, so few requests overall
+# MAGIC - `max_workers=1` — sequential; parallelism actively hurts here
+# MAGIC - `sleep_between=1.0` — stay under the per-second window
+# MAGIC - long exponential backoff with jitter, honouring `Retry-After`
+# MAGIC
+# MAGIC Raise `max_workers` only if you have a **provisioned throughput** endpoint.
 
 # COMMAND ----------
 
-# DBTITLE 1,Embedding helper (explicit timeout + retry)
+# DBTITLE 1,Embedding helper (rate-limit aware)
+import random
 import time
 
 import requests
@@ -349,50 +384,74 @@ _host = w.config.host.rstrip("/")
 _invocations_url = f"{_host}/serving-endpoints/{EMBEDDING_ENDPOINT}/invocations"
 
 
-def embed_batch(texts, timeout=REQUEST_TIMEOUT, max_attempts=4):
-    """Embed a list of strings. Retries on throttling / transient server errors."""
+def _post_embeddings(texts, timeout):
+    """One HTTP call. Returns (vectors, retry_after_seconds_or_None, error_or_None)."""
     headers = {**w.config.authenticate(), "Content-Type": "application/json"}
+    try:
+        resp = requests.post(
+            _invocations_url, headers=headers, json={"input": texts}, timeout=timeout
+        )
+    except requests.Timeout:
+        return None, None, f"request timed out after {timeout}s"
+    except requests.RequestException as exc:
+        return None, None, str(exc)
 
-    last_error = None
-    for attempt in range(max_attempts):
-        try:
-            resp = requests.post(
-                _invocations_url,
-                headers=headers,
-                json={"input": texts},
-                timeout=timeout,
+    if resp.status_code == 200:
+        data = resp.json().get("data") or []
+        if len(data) != len(texts):
+            raise RuntimeError(
+                f"Requested {len(texts)} embeddings, endpoint returned {len(data)}"
             )
-            if resp.status_code == 200:
-                data = resp.json().get("data") or []
-                if len(data) != len(texts):
-                    raise RuntimeError(
-                        f"Requested {len(texts)} embeddings, endpoint returned {len(data)}"
-                    )
-                vectors = []
-                for item in data:
-                    vec = item.get("embedding") or []
-                    if len(vec) != EMBEDDING_DIM:
-                        raise RuntimeError(
-                            f"Expected {EMBEDDING_DIM}-dim vectors, got {len(vec)}. "
-                            "Update ENDPOINT_DIMS and the vector(N) column."
-                        )
-                    vectors.append(vec)
-                return vectors
+        vectors = []
+        for item in data:
+            vec = item.get("embedding") or []
+            if len(vec) != EMBEDDING_DIM:
+                raise RuntimeError(
+                    f"Expected {EMBEDDING_DIM}-dim vectors, got {len(vec)}. "
+                    "Update ENDPOINT_DIMS and the vector(N) column."
+                )
+            vectors.append(vec)
+        return vectors, None, None
 
-            # 429 = rate limited, 5xx = transient; both worth retrying
-            if resp.status_code == 429 or resp.status_code >= 500:
-                last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
-            else:
-                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
-        except requests.Timeout:
-            last_error = f"request timed out after {timeout}s"
-        except requests.RequestException as exc:
-            last_error = str(exc)
+    if resp.status_code == 429 or resp.status_code >= 500:
+        retry_after = resp.headers.get("Retry-After")
+        wait = float(retry_after) if retry_after and retry_after.isdigit() else None
+        return None, wait, f"HTTP {resp.status_code}: {resp.text[:160]}"
 
+    # Payload too large: caller should split the batch
+    if resp.status_code in (400, 413) and len(texts) > 1:
+        return None, None, f"SPLIT:HTTP {resp.status_code}: {resp.text[:160]}"
+
+    raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+
+
+def embed_batch(texts, timeout=REQUEST_TIMEOUT, max_attempts=6):
+    """
+    Embed a list of strings, retrying through rate limits.
+
+    Backoff is deliberately long (10s, 20s, 40s, ...) with jitter: the QPS
+    window won't clear with 1-2s retries, which is what made the first
+    attempt fail on every worker at once.
+    """
+    last_error = None
+
+    for attempt in range(max_attempts):
+        vectors, retry_after, error = _post_embeddings(texts, timeout)
+        if vectors is not None:
+            return vectors
+
+        # Endpoint rejected the payload size — split and recurse
+        if error and error.startswith("SPLIT:"):
+            mid = len(texts) // 2
+            print(f"    payload rejected, splitting {len(texts)} -> {mid}+{len(texts) - mid}")
+            return embed_batch(texts[:mid], timeout) + embed_batch(texts[mid:], timeout)
+
+        last_error = error
         if attempt < max_attempts - 1:
-            backoff = 2 ** attempt
-            print(f"    retry {attempt + 1}/{max_attempts - 1} in {backoff}s ({last_error})")
-            time.sleep(backoff)
+            wait = retry_after if retry_after else 10 * (2 ** attempt)
+            wait += random.uniform(0, 2)  # jitter so retries don't align
+            print(f"    retry {attempt + 1}/{max_attempts - 1} in {wait:.1f}s ({last_error})")
+            time.sleep(wait)
 
     raise RuntimeError(f"Embedding failed after {max_attempts} attempts: {last_error}")
 
@@ -406,27 +465,33 @@ print(f"Returned {len(probe[0])} dims from {EMBEDDING_ENDPOINT}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Embed all chunks in parallel
-from concurrent.futures import ThreadPoolExecutor
-
+# DBTITLE 1,Embed all chunks
 if len(chunk_rows) == 0:
     print("No chunks to embed — run POST /weather/sync first!")
     dbutils.notebook.exit("no_data")
 
 texts = [r["chunk_text"] for r in chunk_rows]
 batches = [texts[i : i + REQUEST_BATCH] for i in range(0, len(texts), REQUEST_BATCH)]
-print(f"Embedding {len(texts)} chunks in {len(batches)} batch(es) "
-      f"across {MAX_WORKERS} worker(s)...")
+print(f"Embedding {len(texts)} chunks in {len(batches)} batch(es), "
+      f"{MAX_WORKERS} worker(s), {SLEEP_BETWEEN}s between requests...")
 
 t0 = time.perf_counter()
-results = []
-for i, batch in enumerate(batches):
-    if i > 0:
-        time.sleep(2)  # 2-second delay between batches to avoid rate limit
-    results.append(embed_batch(batch))
-    print(f"  Completed batch {i+1}/{len(batches)}")
 
-all_embeddings = [vec for batch_vectors in results for vec in batch_vectors]
+if MAX_WORKERS <= 1:
+    all_embeddings = []
+    for i, batch in enumerate(batches, start=1):
+        all_embeddings.extend(embed_batch(batch))
+        print(f"  batch {i}/{len(batches)} -> {len(all_embeddings)}/{len(texts)} chunks")
+        if i < len(batches) and SLEEP_BETWEEN > 0:
+            time.sleep(SLEEP_BETWEEN)
+else:
+    # Only sensible with provisioned throughput; map preserves input order
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        results = list(pool.map(embed_batch, batches))
+    all_embeddings = [vec for batch_vectors in results for vec in batch_vectors]
+
 elapsed = time.perf_counter() - t0
 
 if len(all_embeddings) != len(chunk_rows):

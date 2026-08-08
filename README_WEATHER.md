@@ -233,6 +233,7 @@ Or create the job manually via **Workflows UI** → **Create Job** with two note
 | All similarity scores in a narrow band | Query and documents were embedded by different models — re-run the notebook |
 | Notebook: `TimeoutError: Timed out after 0:05:00` | `serving_endpoints.query()` retries internally for 5 min with no per-request timeout. Both notebook and app now call the REST `invocations` API with an explicit timeout |
 | `429 REQUEST_LIMIT_EXCEEDED` | Workspace QPS limit on pay-per-token endpoints. Keep `max_workers=1`, raise `request_batch`, raise `sleep_between`. See below |
+| Fix pushed to git but notebook behaves the same | Databricks runs its own copy. Pull in the Git folder, then `dbutils.widgets.removeAll()` + re-run cell 1, since **widget values persist and ignore new code defaults**. Check the `Code version:` line to confirm |
 
 `GET /diagnostics` reports the configured endpoints, which ones this app can
 actually see, the live LLM test result, and the table's declared vector width.

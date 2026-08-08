@@ -231,6 +231,7 @@ Or create the job manually via **Workflows UI** → **Create Job** with two note
 | Search returns an error about dimensions | Endpoint output size ≠ `vector(N)` column. Align `EMBEDDING_DIM` and re-run the notebook |
 | RAG summary looks templated | The LLM call failed and fell back to extractive. Check `GET /diagnostics` → `llm_query_test` |
 | All similarity scores in a narrow band | Query and documents were embedded by different models — re-run the notebook |
+| Notebook: `TimeoutError: Timed out after 0:05:00` | `serving_endpoints.query()` retries internally for 5 min with no per-request timeout. Both the notebook and app call the REST `invocations` API directly with an explicit timeout, retry/backoff, and `ThreadPoolExecutor` parallelism. Lower `max_workers` if throttled, or set `max_documents` to cap a run |
 
 `GET /diagnostics` reports the configured endpoints, which ones this app can
 actually see, the live LLM test result, and the table's declared vector width.

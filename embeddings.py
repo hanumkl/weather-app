@@ -32,6 +32,8 @@ CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "100"))
 
 # Max strings per serving-endpoint request
 _REQUEST_BATCH = int(os.environ.get("EMBED_REQUEST_BATCH", "16"))
+# Per-request timeout so a slow endpoint can't hang a web request
+REQUEST_TIMEOUT = int(os.environ.get("EMBED_REQUEST_TIMEOUT", "30"))
 
 
 def chunk_text(
@@ -58,21 +60,37 @@ def chunk_text(
 
 
 def embed_texts(texts: Sequence[str], batch_size: int = _REQUEST_BATCH) -> list[list[float]]:
-    """Embed strings via the Databricks Foundation Model endpoint."""
+    """
+    Embed strings via the Databricks Foundation Model endpoint.
+
+    Calls the REST `invocations` API rather than `serving_endpoints.query()`,
+    which retries internally for up to 5 minutes with no per-request timeout —
+    long enough to hang an HTTP request handler.
+    """
     items = list(texts)
     if not items:
         return []
 
+    import requests
     from databricks.sdk import WorkspaceClient
 
     w = WorkspaceClient()
-    vectors: list[list[float]] = []
+    url = f"{w.config.host.rstrip('/')}/serving-endpoints/{EMBEDDING_ENDPOINT}/invocations"
+    headers = {**w.config.authenticate(), "Content-Type": "application/json"}
 
+    vectors: list[list[float]] = []
     for start in range(0, len(items), batch_size):
         batch = items[start : start + batch_size]
-        response = w.serving_endpoints.query(name=EMBEDDING_ENDPOINT, input=batch)
+        resp = requests.post(
+            url, headers=headers, json={"input": batch}, timeout=REQUEST_TIMEOUT
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Embedding endpoint {EMBEDDING_ENDPOINT!r} returned "
+                f"HTTP {resp.status_code}: {resp.text[:200]}"
+            )
 
-        data = getattr(response, "data", None)
+        data = resp.json().get("data") or []
         if not data:
             raise RuntimeError(
                 f"Embedding endpoint {EMBEDDING_ENDPOINT!r} returned no data. "
@@ -80,7 +98,7 @@ def embed_texts(texts: Sequence[str], batch_size: int = _REQUEST_BATCH) -> list[
             )
 
         for item in data:
-            vec = list(item.embedding or [])
+            vec = list(item.get("embedding") or [])
             if len(vec) != EMBEDDING_DIM:
                 raise RuntimeError(
                     f"Endpoint {EMBEDDING_ENDPOINT!r} returned {len(vec)}-dim vectors "

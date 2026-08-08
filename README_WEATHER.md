@@ -263,8 +263,10 @@ embedded, and the document query only selects chunks with no embedding yet, so a
 429 partway through keeps everything already written — just re-run the notebook.
 
 If the budget is exhausted by activity outside your control, no client-side
-tuning helps. Either wait for capacity, or point `embedding_endpoint` at a less
-contended endpoint. `databricks-bge-large-en` is also 1024-dim, so the schema
+tuning helps. Run `notebooks/probe_embedding_endpoints` to see which endpoints
+respond right now — it sends one short request to each and reports status,
+latency and dimensions. Then either wait for capacity, or point
+`embedding_endpoint` at a less contended endpoint. `databricks-bge-large-en` is also 1024-dim, so the schema
 still fits — but set `DATABRICKS_EMBEDDING_ENDPOINT` in `app.yaml` to match and
 re-embed, since queries and documents must share one vector space.
 

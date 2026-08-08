@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Sequence
 
 logger = logging.getLogger("weather-app.embeddings")
@@ -34,6 +35,8 @@ CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "100"))
 _REQUEST_BATCH = int(os.environ.get("EMBED_REQUEST_BATCH", "16"))
 # Per-request timeout so a slow endpoint can't hang a web request
 REQUEST_TIMEOUT = int(os.environ.get("EMBED_REQUEST_TIMEOUT", "30"))
+# Keep retries short — a user is waiting on the HTTP response
+_MAX_ATTEMPTS = int(os.environ.get("EMBED_MAX_ATTEMPTS", "3"))
 
 
 def chunk_text(
@@ -81,14 +84,7 @@ def embed_texts(texts: Sequence[str], batch_size: int = _REQUEST_BATCH) -> list[
     vectors: list[list[float]] = []
     for start in range(0, len(items), batch_size):
         batch = items[start : start + batch_size]
-        resp = requests.post(
-            url, headers=headers, json={"input": batch}, timeout=REQUEST_TIMEOUT
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Embedding endpoint {EMBEDDING_ENDPOINT!r} returned "
-                f"HTTP {resp.status_code}: {resp.text[:200]}"
-            )
+        resp = _post_with_retry(requests, url, headers, batch)
 
         data = resp.json().get("data") or []
         if not data:
@@ -108,6 +104,37 @@ def embed_texts(texts: Sequence[str], batch_size: int = _REQUEST_BATCH) -> list[
             vectors.append(vec)
 
     return vectors
+
+
+def _post_with_retry(requests_mod, url: str, headers: dict, batch: list[str]):
+    """
+    POST to the embedding endpoint, retrying briefly through 429/5xx.
+
+    Pay-per-token endpoints enforce a workspace QPS limit. Retries stay short
+    here (unlike the notebook's long backoff) because a user is waiting on the
+    HTTP response.
+    """
+    last_error = None
+    for attempt in range(_MAX_ATTEMPTS):
+        resp = requests_mod.post(
+            url, headers=headers, json={"input": batch}, timeout=REQUEST_TIMEOUT
+        )
+        if resp.status_code == 200:
+            return resp
+
+        last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        retryable = resp.status_code == 429 or resp.status_code >= 500
+        if not retryable or attempt == _MAX_ATTEMPTS - 1:
+            break
+
+        retry_after = resp.headers.get("Retry-After")
+        wait = float(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt
+        logger.warning("Embedding endpoint throttled, retrying in %.1fs", wait)
+        time.sleep(wait)
+
+    raise RuntimeError(
+        f"Embedding endpoint {EMBEDDING_ENDPOINT!r} failed: {last_error}"
+    )
 
 
 def embed_query(query: str) -> list[float]:

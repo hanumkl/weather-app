@@ -1,4 +1,5 @@
--- Chunk embeddings for weather_documents (384-dim = all-MiniLM-L6-v2)
+-- Chunk embeddings for weather_documents
+-- 1024-dim = databricks-gte-large-en (Databricks Foundation Model endpoint)
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS weather_embeddings (
@@ -6,7 +7,7 @@ CREATE TABLE IF NOT EXISTS weather_embeddings (
     document_id TEXT NOT NULL REFERENCES weather_documents(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
     chunk_text TEXT NOT NULL,
-    embedding vector(384) NOT NULL,
+    embedding vector(1024) NOT NULL,
     model_name TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (document_id, chunk_index)

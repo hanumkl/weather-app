@@ -17,7 +17,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -q sentence-transformers
+# MAGIC %pip install -q 'databricks-sdk>=0.30.0'
 
 # COMMAND ----------
 
@@ -36,7 +36,7 @@ TOP_K = int(dbutils.widgets.get("top_k"))
 EMBEDDINGS_TABLE = "weather_embeddings"
 DOCUMENTS_TABLE = "weather_documents"
 INDEX_NAME = f"idx_{EMBEDDINGS_TABLE}_embedding_hnsw"
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_ENDPOINT = "databricks-gte-large-en"
 
 # COMMAND ----------
 
@@ -72,12 +72,10 @@ if total == 0:
 
 # COMMAND ----------
 
-# DBTITLE 1,Embed test query
-from sentence_transformers import SentenceTransformer
-
-model = SentenceTransformer(MODEL_NAME)
-vec = model.encode([TEST_QUERY])[0].tolist()
+# DBTITLE 1,Embed test query via serving endpoint
+vec = w.serving_endpoints.query(name=EMBEDDING_ENDPOINT, input=[TEST_QUERY]).data[0].embedding
 vec_str = "[" + ",".join(str(float(x)) for x in vec) + "]"
+print(f"Query embedded to {len(vec)} dims via {EMBEDDING_ENDPOINT}")
 
 # COMMAND ----------
 

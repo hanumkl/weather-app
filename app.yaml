@@ -10,14 +10,15 @@ env:
   - name: NWS_USER_AGENT
     value: "weather-app-bootcamp (student@example.com)"
 
-  # Chat model used for the GET /weather/search RAG summary.
-  # Check GET /diagnostics for endpoint names this app can actually see,
-  # then set the exact name here. Falls back to an extractive summary if
-  # the endpoint is missing or not queryable.
+  # Embedding endpoint used to embed the search query. MUST match the endpoint
+  # the notebook used to embed documents, and EMBEDDING_DIM must match the
+  # vector(N) column in weather_embeddings.
+  - name: DATABRICKS_EMBEDDING_ENDPOINT
+    value: "databricks-gte-large-en"
+  - name: EMBEDDING_DIM
+    value: "1024"
+
+  # Chat model for the GET /weather/search RAG summary.
+  # See GET /diagnostics for names this app can actually query.
   - name: DATABRICKS_LLM_ENDPOINT
     value: "databricks-meta-llama-3-3-70b-instruct"
-
-  # Embedding model used to embed the search query inside the app
-  # (the notebook uses local sentence-transformers instead).
-  - name: DATABRICKS_EMBEDDING_ENDPOINT
-    value: "databricks-bge-large-en"

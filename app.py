@@ -126,12 +126,26 @@ def diagnostics():
     except Exception as exc:  # noqa: BLE001
         info["error"] = f"Could not list serving endpoints: {exc}"
 
-    # Which backend will embed search queries, and does it match ingestion?
-    from embeddings import EMBEDDING_DIM, EMBEDDING_MODEL_NAME, describe_backend
+    # Embedding config (shared by the notebook and this app)
+    from embeddings import describe_backend
 
     info["embedding"] = describe_backend()
-    info["ingestion_model"] = EMBEDDING_MODEL_NAME
-    info["ingestion_dim"] = EMBEDDING_DIM
+
+    # Confirm the vector column width matches what the endpoint returns
+    try:
+        dim_rows = lakebase.run_query(
+            """
+            SELECT a.atttypmod AS declared_dim
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            WHERE c.relname = %s AND a.attname = 'embedding'
+            """,
+            (EMBEDDINGS_TABLE,),
+        )
+        if dim_rows:
+            info["embedding"]["table_vector_dim"] = dim_rows[0]["declared_dim"]
+    except Exception as exc:  # noqa: BLE001
+        info["embedding"]["table_vector_dim_error"] = str(exc)
 
     # Actually try the chat endpoint so failures aren't silent
     try:

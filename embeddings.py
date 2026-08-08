@@ -1,64 +1,37 @@
 """
 Shared embedding + chunking helpers for weather documents.
 
-Two embedding backends:
-  1. sentence-transformers (local) — used by the notebook on a cluster
-  2. Databricks Foundation Model API — used by the Flask app (no torch needed)
+Embeddings come from a Databricks Foundation Model serving endpoint
+(`databricks-gte-large-en`, 1024-dim) rather than a local
+sentence-transformers model. Rationale:
 
-Both produce 384-dim vectors compatible with the same pgvector <=> queries.
+  - Databricks Apps are lightweight containers; torch (~2.5GB) does not
+    install reliably there.
+  - Using one endpoint for BOTH ingestion (notebook) and query embedding
+    (Flask app) guarantees the two sides share a vector space. Mixing models
+    silently produces meaningless cosine scores.
+
+The dimension MUST match the `vector(N)` column in weather_embeddings.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from functools import lru_cache
 from typing import Sequence
 
 logger = logging.getLogger("weather-app.embeddings")
 
-EMBEDDING_MODEL_NAME = os.environ.get(
-    "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-)
-FOUNDATION_EMBEDDING_ENDPOINT = os.environ.get(
+EMBEDDING_ENDPOINT = os.environ.get(
     "DATABRICKS_EMBEDDING_ENDPOINT", "databricks-gte-large-en"
 )
-# Must match the model that produced the stored vectors. MiniLM = 384,
-# databricks-gte-large-en / databricks-bge-large-en = 1024.
-EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
+EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "1024"))
+
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "800"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "100"))
 
-_model = None
-_USE_LOCAL = None
-
-
-def _can_use_local() -> bool:
-    """Check if sentence-transformers + torch are available (e.g. on a cluster)."""
-    global _USE_LOCAL
-    if _USE_LOCAL is not None:
-        return _USE_LOCAL
-    try:
-        from sentence_transformers import SentenceTransformer  # noqa: F401
-        _USE_LOCAL = True
-    except ImportError:
-        _USE_LOCAL = False
-        logger.info(
-            "sentence-transformers not installed — will use Databricks Foundation Model API "
-            "for query embedding. This is normal for Databricks App deployments."
-        )
-    return _USE_LOCAL
-
-
-def get_model():
-    """Load the sentence-transformers model once (only works on clusters with torch)."""
-    global _model
-    if _model is None:
-        from sentence_transformers import SentenceTransformer
-        logger.info("Loading embedding model %s ...", EMBEDDING_MODEL_NAME)
-        _model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        logger.info("Embedding model ready (%s-dim)", EMBEDDING_DIM)
-    return _model
+# Max strings per serving-endpoint request
+_REQUEST_BATCH = int(os.environ.get("EMBED_REQUEST_BATCH", "16"))
 
 
 def chunk_text(
@@ -66,7 +39,7 @@ def chunk_text(
     chunk_size: int = CHUNK_SIZE,
     chunk_overlap: int = CHUNK_OVERLAP,
 ) -> list[str]:
-    """Sliding-window character chunks (same pattern as Day 2 news notebook)."""
+    """Sliding-window character chunks (same pattern as the Day 2 news notebook)."""
     text = (text or "").strip()
     if not text:
         return []
@@ -84,77 +57,39 @@ def chunk_text(
     return chunks
 
 
-def embed_texts(texts: Sequence[str], batch_size: int = 32) -> list[list[float]]:
-    """Encode a batch of strings into 384-dim float vectors."""
-    if not texts:
+def embed_texts(texts: Sequence[str], batch_size: int = _REQUEST_BATCH) -> list[list[float]]:
+    """Embed strings via the Databricks Foundation Model endpoint."""
+    items = list(texts)
+    if not items:
         return []
 
-    if _can_use_local():
-        model = get_model()
-        vectors = model.encode(
-            list(texts),
-            batch_size=batch_size,
-            show_progress_bar=False,
-            normalize_embeddings=False,
-        )
-        return [v.tolist() for v in vectors]
-
-    return _embed_via_foundation_model(list(texts))
-
-
-def _embed_via_foundation_model(texts: list[str]) -> list[list[float]]:
-    """
-    Embed via a Databricks Foundation Model endpoint (no torch needed).
-
-    Only valid when the stored vectors came from this same endpoint — see
-    describe_backend(). Vectors from different models are not comparable,
-    so we refuse to silently truncate or pad to force a dimension match.
-    """
     from databricks.sdk import WorkspaceClient
 
-    endpoint = FOUNDATION_EMBEDDING_ENDPOINT
     w = WorkspaceClient()
-    all_vectors: list[list[float]] = []
+    vectors: list[list[float]] = []
 
-    for text in texts:
-        response = w.serving_endpoints.query(name=endpoint, input=text)
-        if not (hasattr(response, "data") and response.data):
+    for start in range(0, len(items), batch_size):
+        batch = items[start : start + batch_size]
+        response = w.serving_endpoints.query(name=EMBEDDING_ENDPOINT, input=batch)
+
+        data = getattr(response, "data", None)
+        if not data:
             raise RuntimeError(
-                f"Databricks embedding endpoint '{endpoint}' returned no data. "
-                "Check that the endpoint exists and is running."
+                f"Embedding endpoint {EMBEDDING_ENDPOINT!r} returned no data. "
+                "Check that it exists and this identity can query it."
             )
-        vec = list(response.data[0].embedding or [])
-        if len(vec) != EMBEDDING_DIM:
-            raise RuntimeError(
-                f"Endpoint '{endpoint}' returned {len(vec)}-dim vectors but the "
-                f"stored embeddings are {EMBEDDING_DIM}-dim. Set EMBEDDING_MODEL / "
-                f"DATABRICKS_EMBEDDING_ENDPOINT so ingestion and search use the "
-                f"same model, then re-run the embedding notebook."
-            )
-        all_vectors.append(vec)
 
-    return all_vectors
+        for item in data:
+            vec = list(item.embedding or [])
+            if len(vec) != EMBEDDING_DIM:
+                raise RuntimeError(
+                    f"Endpoint {EMBEDDING_ENDPOINT!r} returned {len(vec)}-dim vectors "
+                    f"but EMBEDDING_DIM is {EMBEDDING_DIM}. Update EMBEDDING_DIM and the "
+                    f"vector(N) column so they agree, then re-run the embedding notebook."
+                )
+            vectors.append(vec)
 
-
-def describe_backend() -> dict:
-    """Report which embedding backend will be used, for /diagnostics."""
-    if _can_use_local():
-        return {
-            "backend": "sentence-transformers (local)",
-            "model": EMBEDDING_MODEL_NAME,
-            "dim": EMBEDDING_DIM,
-            "matches_ingestion": True,
-        }
-    return {
-        "backend": "databricks foundation model",
-        "endpoint": FOUNDATION_EMBEDDING_ENDPOINT,
-        "dim": EMBEDDING_DIM,
-        "matches_ingestion": FOUNDATION_EMBEDDING_ENDPOINT == EMBEDDING_MODEL_NAME,
-        "note": (
-            "Search results are only meaningful if the notebook embedded documents "
-            "with this same endpoint."
-        ),
-    }
+    return vectors
 
 
 def embed_query(query: str) -> list[float]:
@@ -167,9 +102,24 @@ def vector_literal(embedding: Sequence[float]) -> str:
     return "[" + ",".join(str(float(x)) for x in embedding) + "]"
 
 
-@lru_cache(maxsize=1)
 def warm_model() -> str:
-    """Eagerly load the model if available; returns the model name."""
-    if _can_use_local():
-        get_model()
-    return EMBEDDING_MODEL_NAME
+    """
+    No local model to load — kept so callers have a single place to verify the
+    endpoint is reachable before serving traffic. Returns the endpoint name.
+    """
+    return EMBEDDING_ENDPOINT
+
+
+def describe_backend() -> dict:
+    """Report the embedding configuration, for /diagnostics."""
+    return {
+        "backend": "databricks foundation model",
+        "endpoint": EMBEDDING_ENDPOINT,
+        "dim": EMBEDDING_DIM,
+        "chunk_size": CHUNK_SIZE,
+        "chunk_overlap": CHUNK_OVERLAP,
+        "note": (
+            "The embedding notebook uses this same endpoint, so query and document "
+            "vectors share one space."
+        ),
+    }

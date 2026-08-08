@@ -7,10 +7,19 @@
 # MAGIC It:
 # MAGIC 1. Reads the `weather_documents` table from Lakebase (synced via `POST /weather/sync`).
 # MAGIC 2. Chunks each document's `narrative_text` using a sliding window (800 chars, 100 overlap).
-# MAGIC 3. Embeds each chunk using `sentence-transformers/all-MiniLM-L6-v2` (384-dim).
+# MAGIC 3. Embeds each chunk with the **`databricks-gte-large-en`** Foundation Model
+# MAGIC    endpoint (1024-dim).
 # MAGIC 4. Writes embeddings into `weather_embeddings` using psycopg2 + `execute_values`
 # MAGIC    with `%s::vector` casts (no Spark JDBC — unreliable against this Lakebase instance).
 # MAGIC 5. Creates an HNSW index for fast cosine-similarity search via pgvector's `<=>` operator.
+# MAGIC
+# MAGIC ### Why a Foundation Model endpoint instead of sentence-transformers?
+# MAGIC
+# MAGIC The Flask app (`POST /weather/search`) must embed the incoming query with the
+# MAGIC **same model** used here, or the cosine scores are meaningless. Databricks Apps
+# MAGIC are lightweight containers where torch (~2.5GB) doesn't install reliably, so
+# MAGIC both sides call this shared serving endpoint instead. Dimensionality is
+# MAGIC therefore **1024**, not MiniLM's 384 — documented in `README_WEATHER.md`.
 # MAGIC
 # MAGIC **Data source:** National Weather Service API (api.weather.gov) — free, no key needed.
 
@@ -22,6 +31,8 @@
 # MAGIC Uninstall `psycopg2` / `psycopg2-binary` first — the Databricks runtime already
 # MAGIC ships psycopg2, and having a pip-installed copy alongside it crashes the kernel
 # MAGIC ("Fatal error: The Python kernel is unresponsive").
+# MAGIC
+# MAGIC No `sentence-transformers` / `torch` needed: embeddings come from a serving endpoint.
 
 # COMMAND ----------
 
@@ -30,8 +41,8 @@
 
 # COMMAND ----------
 
-# DBTITLE 1,Install embedding dependencies
-# MAGIC %pip install -q sentence-transformers requests
+# DBTITLE 1,Install SDK
+# MAGIC %pip install -q 'databricks-sdk>=0.30.0'
 
 # COMMAND ----------
 
@@ -46,23 +57,36 @@ dbutils.library.restartPython()
 
 dbutils.widgets.text("documents_table", "weather_documents", "Source table (raw docs)")
 dbutils.widgets.text("embeddings_table", "weather_embeddings", "Destination table (vectors)")
-dbutils.widgets.text("embedding_model", "sentence-transformers/all-MiniLM-L6-v2", "Embedding model")
+dbutils.widgets.text("embedding_endpoint", "databricks-gte-large-en", "Embedding endpoint")
 dbutils.widgets.text("chunk_size", "800", "Chunk size (chars)")
 dbutils.widgets.text("chunk_overlap", "100", "Chunk overlap (chars)")
-dbutils.widgets.text("batch_size", "32", "Embedding batch size")
+dbutils.widgets.text("request_batch", "16", "Strings per embedding request")
+dbutils.widgets.dropdown("rebuild_all", "false", ["false", "true"], "Re-embed everything")
 
 DOCUMENTS_TABLE = dbutils.widgets.get("documents_table")
 EMBEDDINGS_TABLE = dbutils.widgets.get("embeddings_table")
-EMBEDDING_MODEL_NAME = dbutils.widgets.get("embedding_model")
+EMBEDDING_ENDPOINT = dbutils.widgets.get("embedding_endpoint")
 CHUNK_SIZE = int(dbutils.widgets.get("chunk_size"))
 CHUNK_OVERLAP = int(dbutils.widgets.get("chunk_overlap"))
-BATCH_SIZE = int(dbutils.widgets.get("batch_size"))
+REQUEST_BATCH = int(dbutils.widgets.get("request_batch"))
+REBUILD_ALL = dbutils.widgets.get("rebuild_all") == "true"
 
-EMBEDDING_DIM = 384
+# Known output sizes for Databricks Foundation Model embedding endpoints
+ENDPOINT_DIMS = {
+    "databricks-gte-large-en": 1024,
+    "databricks-bge-large-en": 1024,
+}
+EMBEDDING_DIM = ENDPOINT_DIMS.get(EMBEDDING_ENDPOINT)
+if EMBEDDING_DIM is None:
+    raise ValueError(
+        f"Unknown embedding endpoint {EMBEDDING_ENDPOINT!r} — add its output dimension "
+        "to ENDPOINT_DIMS above before running."
+    )
 
-print(f"Model: {EMBEDDING_MODEL_NAME} -> {EMBEDDING_DIM}-dim vectors")
+print(f"Endpoint: {EMBEDDING_ENDPOINT} -> {EMBEDDING_DIM}-dim vectors")
 print(f"Chunking: size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}")
 print(f"Tables: {DOCUMENTS_TABLE} -> {EMBEDDINGS_TABLE}")
+print(f"Rebuild all: {REBUILD_ALL}")
 
 # COMMAND ----------
 
@@ -101,40 +125,10 @@ print(f"User: {db_user}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Test connection
+# DBTITLE 1,Connection helpers
 import psycopg2
+from psycopg2.extras import RealDictCursor
 
-try:
-    conn = psycopg2.connect(
-        host=db_host,
-        port=db_port,
-        dbname=db_name,
-        user=db_user,
-        password=db_password,
-        sslmode="require",
-        connect_timeout=10,
-    )
-    cursor = conn.cursor()
-    cursor.execute(f"SELECT COUNT(*) FROM {DOCUMENTS_TABLE}")
-    count = cursor.fetchone()[0]
-    print(f"Connection successful! Found {count} rows in {DOCUMENTS_TABLE}")
-    cursor.close()
-    conn.close()
-except Exception as e:
-    print(f"Connection failed: {e}")
-    raise
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Ensure Tables Exist
-# MAGIC
-# MAGIC Creates `weather_documents` and `weather_embeddings` (with pgvector extension)
-# MAGIC if they don't already exist.
-
-# COMMAND ----------
-
-# DBTITLE 1,Create tables + HNSW index
 def get_conn():
     return psycopg2.connect(
         host=db_host,
@@ -143,16 +137,41 @@ def get_conn():
         user=db_user,
         password=db_password,
         sslmode="require",
+        connect_timeout=10,
     )
 
-def run_ddl(sql):
+def run_ddl(sql, params=None):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(sql)
+    cur.execute(sql, params)
     conn.commit()
     cur.close()
     conn.close()
 
+def run_query(sql, params=None):
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
+
+count = run_query(f"SELECT COUNT(*) AS n FROM {DOCUMENTS_TABLE}")[0]["n"]
+print(f"Connection successful! Found {count} rows in {DOCUMENTS_TABLE}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Ensure Tables Exist (with dimension migration)
+# MAGIC
+# MAGIC If `weather_embeddings` already exists with a different `vector(N)` width
+# MAGIC (e.g. a previous 384-dim MiniLM run), it is dropped and recreated. Vectors
+# MAGIC from different models can't be compared, so old rows must go.
+
+# COMMAND ----------
+
+# DBTITLE 1,Create tables + HNSW index
 run_ddl("CREATE EXTENSION IF NOT EXISTS vector")
 
 run_ddl(f"""
@@ -169,6 +188,29 @@ run_ddl(f"""
         synced_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
 """)
+
+# atttypmod holds the declared vector width for pgvector columns
+existing_dim_rows = run_query(
+    """
+    SELECT a.atttypmod AS declared_dim
+    FROM pg_attribute a
+    JOIN pg_class c ON c.oid = a.attrelid
+    WHERE c.relname = %s AND a.attname = 'embedding'
+    """,
+    (EMBEDDINGS_TABLE,),
+)
+
+if existing_dim_rows:
+    existing_dim = existing_dim_rows[0]["declared_dim"]
+    if existing_dim != EMBEDDING_DIM:
+        print(
+            f"{EMBEDDINGS_TABLE} exists with vector({existing_dim}) but this run produces "
+            f"vector({EMBEDDING_DIM}). Dropping and recreating — stale vectors from a "
+            f"different model are not comparable."
+        )
+        run_ddl(f"DROP TABLE {EMBEDDINGS_TABLE}")
+    else:
+        print(f"{EMBEDDINGS_TABLE} already has the correct vector({EMBEDDING_DIM}) column")
 
 run_ddl(f"""
     CREATE TABLE IF NOT EXISTS {EMBEDDINGS_TABLE} (
@@ -194,39 +236,39 @@ run_ddl(f"""
     USING hnsw (embedding vector_cosine_ops)
 """)
 
-print(f"Tables {DOCUMENTS_TABLE} and {EMBEDDINGS_TABLE} ready (with HNSW index)")
+print(f"Tables ready: {DOCUMENTS_TABLE}, {EMBEDDINGS_TABLE} (vector({EMBEDDING_DIM}) + HNSW)")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Fetch Documents to Embed
 # MAGIC
-# MAGIC Reads rows from `weather_documents` that do NOT yet have an entry in
-# MAGIC `weather_embeddings` (LEFT JOIN WHERE NULL pattern).
+# MAGIC By default only documents with no embeddings yet (LEFT JOIN WHERE NULL).
+# MAGIC Set the `rebuild_all` widget to `true` to re-embed everything.
 
 # COMMAND ----------
 
-# DBTITLE 1,Query unembedded documents
-from psycopg2.extras import RealDictCursor
-
-conn = get_conn()
-cur = conn.cursor(cursor_factory=RealDictCursor)
-cur.execute(f"""
-    SELECT d.id, d.narrative_text, d.location, d.source_type, d.headline
-    FROM {DOCUMENTS_TABLE} d
-    LEFT JOIN {EMBEDDINGS_TABLE} e ON e.document_id = d.id
-    WHERE e.document_id IS NULL
-      AND COALESCE(TRIM(d.narrative_text), '') <> ''
-    ORDER BY d.synced_at DESC
-""")
-docs = cur.fetchall()
-cur.close()
-conn.close()
+# DBTITLE 1,Query documents needing embeddings
+if REBUILD_ALL:
+    docs = run_query(f"""
+        SELECT d.id, d.narrative_text, d.location, d.source_type, d.headline
+        FROM {DOCUMENTS_TABLE} d
+        WHERE COALESCE(TRIM(d.narrative_text), '') <> ''
+        ORDER BY d.synced_at DESC
+    """)
+else:
+    docs = run_query(f"""
+        SELECT d.id, d.narrative_text, d.location, d.source_type, d.headline
+        FROM {DOCUMENTS_TABLE} d
+        LEFT JOIN {EMBEDDINGS_TABLE} e ON e.document_id = d.id
+        WHERE e.document_id IS NULL
+          AND COALESCE(TRIM(d.narrative_text), '') <> ''
+        ORDER BY d.synced_at DESC
+    """)
 
 print(f"Documents to embed: {len(docs)}")
-if docs:
-    for d in docs[:3]:
-        print(f"  [{d['source_type']}] {d['location']}: {d['headline']}")
+for d in docs[:3]:
+    print(f"  [{d['source_type']}] {d['location']}: {d['headline']}")
 
 # COMMAND ----------
 
@@ -234,9 +276,8 @@ if docs:
 # MAGIC ## Chunk Documents
 # MAGIC
 # MAGIC Sliding-window character chunks: `CHUNK_SIZE=800`, `CHUNK_OVERLAP=100`.
-# MAGIC Most NWS forecast periods are short (~1-2 sentences), so many documents
-# MAGIC produce only 1 chunk. Alerts with combined description + instruction
-# MAGIC text may produce 2-3 chunks.
+# MAGIC Most NWS forecast periods are short (1-2 sentences) so they yield a single
+# MAGIC chunk; alerts combining `description` + `instruction` may yield 2-3.
 
 # COMMAND ----------
 
@@ -260,8 +301,7 @@ def chunk_text(text, chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP):
 
 chunk_rows = []
 for doc in docs:
-    chunks = chunk_text(doc["narrative_text"])
-    for idx, text in enumerate(chunks):
+    for idx, text in enumerate(chunk_text(doc["narrative_text"])):
         chunk_rows.append({
             "id": f"{doc['id']}_{idx}",
             "document_id": doc["id"],
@@ -269,8 +309,7 @@ for doc in docs:
             "chunk_text": text,
         })
 
-print(f"Total chunks to embed: {len(chunk_rows)}")
-print(f"  from {len(docs)} documents")
+print(f"Total chunks to embed: {len(chunk_rows)} (from {len(docs)} documents)")
 if chunk_rows:
     avg_len = sum(len(c["chunk_text"]) for c in chunk_rows) / len(chunk_rows)
     print(f"  avg chunk length: {avg_len:.0f} chars")
@@ -280,28 +319,33 @@ if chunk_rows:
 # MAGIC %md
 # MAGIC ## Compute Embeddings
 # MAGIC
-# MAGIC Loads `sentence-transformers/all-MiniLM-L6-v2` once and encodes in batches.
+# MAGIC Batched calls to the Foundation Model endpoint. The Flask app's search
+# MAGIC endpoint calls this same endpoint, so query and document vectors match.
 
 # COMMAND ----------
 
-# DBTITLE 1,Embed chunks
-from sentence_transformers import SentenceTransformer
-
+# DBTITLE 1,Embed chunks via serving endpoint
 if len(chunk_rows) == 0:
     print("No chunks to embed — run POST /weather/sync first!")
     dbutils.notebook.exit("no_data")
 
-print(f"Loading model {EMBEDDING_MODEL_NAME}...")
-model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-
-print("Computing embeddings...")
-all_embeddings = []
 texts = [r["chunk_text"] for r in chunk_rows]
-for i in range(0, len(texts), BATCH_SIZE):
-    batch = texts[i : i + BATCH_SIZE]
-    vectors = model.encode(batch, show_progress_bar=False)
-    all_embeddings.extend(vectors.tolist())
-    print(f"  Embedded {min(i + BATCH_SIZE, len(texts))} / {len(texts)} chunks")
+all_embeddings = []
+
+for i in range(0, len(texts), REQUEST_BATCH):
+    batch = texts[i : i + REQUEST_BATCH]
+    response = w.serving_endpoints.query(name=EMBEDDING_ENDPOINT, input=batch)
+    if not response.data:
+        raise RuntimeError(f"Endpoint {EMBEDDING_ENDPOINT} returned no data")
+    for item in response.data:
+        vec = list(item.embedding or [])
+        if len(vec) != EMBEDDING_DIM:
+            raise RuntimeError(
+                f"Expected {EMBEDDING_DIM}-dim vectors, got {len(vec)}. "
+                "Update ENDPOINT_DIMS and the vector(N) column."
+            )
+        all_embeddings.append(vec)
+    print(f"  Embedded {min(i + REQUEST_BATCH, len(texts))} / {len(texts)} chunks")
 
 print(f"Computed {len(all_embeddings)} embeddings ({EMBEDDING_DIM}-dim each)")
 
@@ -310,9 +354,9 @@ print(f"Computed {len(all_embeddings)} embeddings ({EMBEDDING_DIM}-dim each)")
 # MAGIC %md
 # MAGIC ## Upsert Embeddings into Lakebase
 # MAGIC
-# MAGIC Uses `psycopg2.extras.execute_values` for batch insert performance.
-# MAGIC Each embedding is cast to Postgres `vector` type via `%s::vector`.
-# MAGIC `ON CONFLICT` handles re-runs gracefully.
+# MAGIC `psycopg2.extras.execute_values` for batch throughput. Each embedding is
+# MAGIC cast to the Postgres `vector` type via `%s::vector`. `ON CONFLICT` makes
+# MAGIC re-runs idempotent.
 
 # COMMAND ----------
 
@@ -322,95 +366,72 @@ from psycopg2.extras import execute_values
 
 now = datetime.now(timezone.utc).isoformat()
 
-insert_data = []
-for row, vec in zip(chunk_rows, all_embeddings):
-    vec_literal = "[" + ",".join(str(float(x)) for x in vec) + "]"
-    insert_data.append((
+insert_data = [
+    (
         row["id"],
         row["document_id"],
         row["chunk_index"],
         row["chunk_text"],
-        vec_literal,
-        EMBEDDING_MODEL_NAME,
+        "[" + ",".join(str(float(x)) for x in vec) + "]",
+        EMBEDDING_ENDPOINT,
         now,
-    ))
+    )
+    for row, vec in zip(chunk_rows, all_embeddings)
+]
 
-if insert_data:
-    print(f"Inserting {len(insert_data)} embeddings into {EMBEDDINGS_TABLE}...")
+print(f"Inserting {len(insert_data)} embeddings into {EMBEDDINGS_TABLE}...")
 
-    conn = get_conn()
-    cur = conn.cursor()
+insert_sql = f"""
+    INSERT INTO {EMBEDDINGS_TABLE} (
+        id, document_id, chunk_index, chunk_text, embedding, model_name, created_at
+    ) VALUES %s
+    ON CONFLICT (id) DO UPDATE SET
+        chunk_text = EXCLUDED.chunk_text,
+        embedding = EXCLUDED.embedding,
+        model_name = EXCLUDED.model_name,
+        created_at = EXCLUDED.created_at
+"""
+template = "(%s, %s, %s, %s, %s::vector, %s, %s)"
 
-    insert_sql = f"""
-        INSERT INTO {EMBEDDINGS_TABLE} (
-            id, document_id, chunk_index, chunk_text, embedding, model_name, created_at
-        ) VALUES %s
-        ON CONFLICT (id) DO UPDATE SET
-            chunk_text = EXCLUDED.chunk_text,
-            embedding = EXCLUDED.embedding,
-            model_name = EXCLUDED.model_name,
-            created_at = EXCLUDED.created_at
-    """
-    template = "(%s, %s, %s, %s, %s::vector, %s, %s)"
+conn = get_conn()
+cur = conn.cursor()
+execute_values(cur, insert_sql, insert_data, template=template, page_size=100)
+conn.commit()
+cur.close()
+conn.close()
 
-    execute_values(cur, insert_sql, insert_data, template=template, page_size=100)
-    inserted_count = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    print(f"Successfully upserted {inserted_count} embeddings into {EMBEDDINGS_TABLE}")
-else:
-    print("No embeddings to write.")
+print(f"Successfully upserted {len(insert_data)} embeddings into {EMBEDDINGS_TABLE}")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Verify
 # MAGIC
-# MAGIC Quick sanity check: count rows and run a sample similarity query.
+# MAGIC Row count plus a live similarity query, so we know retrieval works before
+# MAGIC hitting the REST API.
 
 # COMMAND ----------
 
-# DBTITLE 1,Verify embeddings
-conn = get_conn()
-cur = conn.cursor(cursor_factory=RealDictCursor)
-
-cur.execute(f"SELECT COUNT(*) AS n FROM {EMBEDDINGS_TABLE}")
-total = cur.fetchone()["n"]
+# DBTITLE 1,Verify with a test similarity search
+total = run_query(f"SELECT COUNT(*) AS n FROM {EMBEDDINGS_TABLE}")[0]["n"]
 print(f"Total rows in {EMBEDDINGS_TABLE}: {total}")
 
-cur.execute(f"""
-    SELECT e.id, e.chunk_text, d.location, d.source_type, d.headline
+test_query = "flash flood risk this weekend"
+qvec = w.serving_endpoints.query(name=EMBEDDING_ENDPOINT, input=[test_query]).data[0].embedding
+vec_str = "[" + ",".join(str(float(x)) for x in qvec) + "]"
+
+results = run_query(f"""
+    SELECT d.location, d.source_type, d.headline, e.chunk_text,
+           1 - (e.embedding <=> %s::vector) AS similarity
     FROM {EMBEDDINGS_TABLE} e
     JOIN {DOCUMENTS_TABLE} d ON d.id = e.document_id
+    ORDER BY e.embedding <=> %s::vector
     LIMIT 5
-""")
-samples = cur.fetchall()
-print(f"\nSample rows:")
-for s in samples:
-    print(f"  [{s['source_type']}] {s['location']}: {s['headline']}")
-    print(f"    chunk: {s['chunk_text'][:100]}...")
+""", (vec_str, vec_str))
 
-# Test a similarity query
-if total > 0:
-    test_query = "severe weather warning"
-    test_vec = model.encode([test_query])[0].tolist()
-    vec_str = "[" + ",".join(str(float(x)) for x in test_vec) + "]"
-    cur.execute(f"""
-        SELECT d.location, d.headline, e.chunk_text,
-               1 - (e.embedding <=> %s::vector) AS similarity
-        FROM {EMBEDDINGS_TABLE} e
-        JOIN {DOCUMENTS_TABLE} d ON d.id = e.document_id
-        ORDER BY e.embedding <=> %s::vector
-        LIMIT 3
-    """, (vec_str, vec_str))
-    results = cur.fetchall()
-    print(f"\nTest search: '{test_query}'")
-    for r in results:
-        print(f"  [{r['similarity']:.4f}] {r['location']}: {r['headline']}")
-        print(f"    {r['chunk_text'][:80]}...")
+print(f"\nTest search: {test_query!r}")
+for r in results:
+    print(f"  [{r['similarity']:.4f}] ({r['source_type']}) {r['location']}: {r['headline']}")
+    print(f"      {r['chunk_text'][:90]}...")
 
-cur.close()
-conn.close()
-print("\nDone! The POST /weather/search endpoint can now return results.")
+print("\nDone! POST /weather/search can now return results.")

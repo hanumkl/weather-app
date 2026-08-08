@@ -43,17 +43,39 @@ Geocoding uses a **static city → lat/lon map** (20 major US cities) so demos s
 | `document_id` | TEXT FK | References `weather_documents.id` |
 | `chunk_index` | INT | Chunk position in document |
 | `chunk_text` | TEXT | The chunked text |
-| `embedding` | vector(384) | 384-dim embedding vector |
+| `embedding` | vector(1024) | 1024-dim embedding vector |
 | `model_name` | TEXT | Model provenance |
 | `created_at` | TIMESTAMPTZ | When embedded |
 
 **Chunking:** `CHUNK_SIZE=800`, `CHUNK_OVERLAP=100` (same as Day 2 news pipeline).
 
-**Model:** `sentence-transformers/all-MiniLM-L6-v2` → **384 dimensions**.
-
 **Index:** `USING hnsw (embedding vector_cosine_ops)` for fast `<=>` queries.
 
 **Upserts:** `ON CONFLICT (id) DO UPDATE` — re-running sync never duplicates rows.
+
+### Embedding model: `databricks-gte-large-en` (1024-dim), not MiniLM
+
+The assignment suggests `sentence-transformers/all-MiniLM-L6-v2` (384-dim) but allows a
+different model if the dimensionality is documented. This project uses the Databricks
+Foundation Model endpoint **`databricks-gte-large-en` → 1024 dimensions** for both
+ingestion and query embedding.
+
+Why:
+
+1. **Both sides must share one vector space.** The Flask app embeds the incoming search
+   query; the notebook embeds the documents. If those use different models, cosine
+   similarity compares unrelated vector spaces and the ranking is meaningless. An earlier
+   version of this project hit exactly that bug — MiniLM documents scored against a
+   truncated BGE query vector produced results clustered in a meaningless 37–39% band.
+2. **Databricks Apps can't host torch.** Apps are lightweight containers; `torch` is
+   ~2.5GB and fails to install, so the app cannot run sentence-transformers locally. A
+   shared serving endpoint is reachable from both the app and the cluster.
+3. **No model download at runtime**, so notebook runs and app cold starts are faster.
+
+The dimension is configurable via `EMBEDDING_DIM` + `DATABRICKS_EMBEDDING_ENDPOINT`
+(set in `app.yaml` and the notebook widgets). The ingest notebook detects a mismatch
+between the endpoint's output size and the existing `vector(N)` column, then drops and
+recreates the table — stale vectors from a different model are not comparable.
 
 ---
 
@@ -129,11 +151,14 @@ Expected response: `{"synced": 28, "locations": [...], "documents_fetched": 28}`
 1. In your Git folder, open `notebooks/ingest_weather_embeddings.py`.
 2. Attach it to a running cluster.
 3. **Run All** — it will:
-   - Uninstall `psycopg2` / `psycopg2-binary`, then install `sentence-transformers`
+   - Uninstall `psycopg2` / `psycopg2-binary` (see note below)
    - Read unembedded docs from `weather_documents`
-   - Chunk and embed them (384-dim)
+   - Chunk and embed them via `databricks-gte-large-en` (1024-dim)
    - Write vectors into `weather_embeddings` via `execute_values` + `::vector`
    - Verify with a sample similarity query
+
+Widgets let you override the endpoint, chunk size/overlap, and set
+`rebuild_all=true` to re-embed every document instead of only new ones.
 
 > **Why uninstall psycopg2?** The Databricks runtime already ships `psycopg2`.
 > A pip-installed copy alongside it crashes the kernel with
@@ -197,10 +222,26 @@ Or create the job manually via **Workflows UI** → **Create Job** with two note
 
 ---
 
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| App deploy fails | Don't put `torch` / `sentence-transformers` in `requirements.txt` — too large for Apps |
+| Notebook: "Python kernel is unresponsive" | A pip-installed psycopg2 conflicts with the runtime's. Notebooks uninstall it first |
+| Search returns an error about dimensions | Endpoint output size ≠ `vector(N)` column. Align `EMBEDDING_DIM` and re-run the notebook |
+| RAG summary looks templated | The LLM call failed and fell back to extractive. Check `GET /diagnostics` → `llm_query_test` |
+| All similarity scores in a narrow band | Query and documents were embedded by different models — re-run the notebook |
+
+`GET /diagnostics` reports the configured endpoints, which ones this app can
+actually see, the live LLM test result, and the table's declared vector width.
+
 ## Known Limitations
 
 - Static geocode covers ~20 US cities; others need `lat,lon` format.
 - NWS alerts are sparse in calm weather — forecasts keep the corpus populated.
-- First search downloads MiniLM weights (~90MB); cold start takes ~1 min.
-- RAG summary needs a Databricks model serving endpoint; falls back to extractive without one.
+- Embedding calls go one batch at a time; fine for homework volumes, would want
+  concurrency for large corpora.
+- RAG summary needs a queryable chat endpoint; falls back to extractive without one.
 - HNSW speedup is modest on small tables.
+- Deviates from the assignment's suggested MiniLM model (see the embedding model
+  section above for the reasoning).

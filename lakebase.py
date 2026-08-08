@@ -26,7 +26,8 @@ _KEY = os.environ.get("LAKEBASE_SECRET_KEY", "lakebase-url")
 
 DOCUMENTS_TABLE = os.environ.get("WEATHER_DOCUMENTS_TABLE", "weather_documents")
 EMBEDDINGS_TABLE = os.environ.get("WEATHER_EMBEDDINGS_TABLE", "weather_embeddings")
-EMBEDDING_DIM = 384
+# Must match the embedding endpoint's output size (databricks-gte-large-en = 1024)
+EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "1024"))
 
 
 def _lakebase_url() -> str:

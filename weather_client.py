@@ -257,7 +257,8 @@ class WeatherClient:
             start or name,
             "forecast",
         )
-        headline = f"{display}: {name}"
+        # location is stored in its own column, so keep the headline to the period name
+        headline = name
         event = period.get("shortForecast")
 
         return {

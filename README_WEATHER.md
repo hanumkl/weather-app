@@ -232,7 +232,7 @@ Or create the job manually via **Workflows UI** → **Create Job** with two note
 | RAG summary looks templated | The LLM call failed and fell back to extractive. Check `GET /diagnostics` → `llm_query_test` |
 | All similarity scores in a narrow band | Query and documents were embedded by different models — re-run the notebook |
 | Notebook: `TimeoutError: Timed out after 0:05:00` | `serving_endpoints.query()` retries internally for 5 min with no per-request timeout. Both notebook and app now call the REST `invocations` API with an explicit timeout |
-| `429 REQUEST_LIMIT_EXCEEDED` | Workspace QPS limit on pay-per-token endpoints. Keep `max_workers=1`, raise `request_batch`, raise `sleep_between`. See below |
+| `429 REQUEST_LIMIT_EXCEEDED` | Shared workspace request budget for pay-per-token endpoints is saturated. Runs are resumable, so re-run to continue; or switch `embedding_endpoint`. See below |
 | Fix pushed to git but notebook behaves the same | Databricks runs its own copy. Pull in the Git folder, then `dbutils.widgets.removeAll()` + re-run cell 1, since **widget values persist and ignore new code defaults**. Check the `Code version:` line to confirm |
 
 `GET /diagnostics` reports the configured endpoints, which ones this app can
@@ -240,21 +240,33 @@ actually see, the live LLM test result, and the table's declared vector width.
 
 ### Rate limits (important)
 
-Pay-per-token Foundation Model endpoints enforce a **workspace QPS limit**.
-Because the limit counts *queries per second* rather than tokens, throughput
-comes from **fewer, larger, spaced-out requests** — parallelism makes it worse.
-The notebook defaults reflect this:
+Pay-per-token Foundation Model endpoints share one **workspace-wide** request
+budget, so a busy workspace (e.g. a whole bootcamp cohort on
+`databricks-gte-large-en`) can exhaust it. Exceeding it returns
+`429 REQUEST_LIMIT_EXCEEDED`. Because the limit counts *requests* rather than
+tokens, throughput comes from **fewer, larger, spaced-out requests**;
+the embedding path is deliberately sequential:
 
 | Widget | Default | Why |
 |---|---|---|
 | `request_batch` | 32 | Many chunks per request → few requests total |
-| `max_workers` | 1 | Sequential. Raise only with a provisioned throughput endpoint |
 | `sleep_between` | 1.0 | Stays inside the per-second window |
 | `request_timeout` | 60 | Explicit, so a stuck call fails fast |
+| `max_attempts` | 8 | Rides out a temporarily saturated endpoint |
 
-On 429 the notebook backs off long (10s, 20s, 40s…) with jitter and honours
-`Retry-After`. Short 1–2s retries do not clear the window. If the endpoint
-rejects an oversized payload, the batch is split in half automatically.
+On 429 the notebook backs off 10s, 20s, 40s (capped at 60s) with jitter and
+honours `Retry-After`. Short 1–2s retries do not clear the window. Oversized
+payloads are split in half automatically.
+
+**Progress is resumable.** Each batch is committed to Lakebase as soon as it is
+embedded, and the document query only selects chunks with no embedding yet, so a
+429 partway through keeps everything already written — just re-run the notebook.
+
+If the budget is exhausted by activity outside your control, no client-side
+tuning helps. Either wait for capacity, or point `embedding_endpoint` at a less
+contended endpoint. `databricks-bge-large-en` is also 1024-dim, so the schema
+still fits — but set `DATABRICKS_EMBEDDING_ENDPOINT` in `app.yaml` to match and
+re-embed, since queries and documents must share one vector space.
 
 The app retries only briefly (3 attempts) since a user is waiting on the response.
 

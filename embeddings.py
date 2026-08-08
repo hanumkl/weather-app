@@ -20,7 +20,12 @@ logger = logging.getLogger("weather-app.embeddings")
 EMBEDDING_MODEL_NAME = os.environ.get(
     "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
 )
-EMBEDDING_DIM = 384
+FOUNDATION_EMBEDDING_ENDPOINT = os.environ.get(
+    "DATABRICKS_EMBEDDING_ENDPOINT", "databricks-gte-large-en"
+)
+# Must match the model that produced the stored vectors. MiniLM = 384,
+# databricks-gte-large-en / databricks-bge-large-en = 1024.
+EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "800"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "100"))
 
@@ -99,37 +104,57 @@ def embed_texts(texts: Sequence[str], batch_size: int = 32) -> list[list[float]]
 
 def _embed_via_foundation_model(texts: list[str]) -> list[list[float]]:
     """
-    Fallback: use Databricks Foundation Model Serving for embeddings.
-    Works inside Databricks Apps without needing torch installed.
+    Embed via a Databricks Foundation Model endpoint (no torch needed).
+
+    Only valid when the stored vectors came from this same endpoint — see
+    describe_backend(). Vectors from different models are not comparable,
+    so we refuse to silently truncate or pad to force a dimension match.
     """
     from databricks.sdk import WorkspaceClient
 
-    endpoint = os.environ.get(
-        "DATABRICKS_EMBEDDING_ENDPOINT", "databricks-bge-large-en"
-    )
+    endpoint = FOUNDATION_EMBEDDING_ENDPOINT
     w = WorkspaceClient()
     all_vectors: list[list[float]] = []
 
     for text in texts:
-        response = w.serving_endpoints.query(
-            name=endpoint,
-            input=text,
-        )
-        if hasattr(response, "data") and response.data:
-            vec = response.data[0].embedding
-            # Pad or truncate to 384-dim if the Foundation Model returns a different size
-            if len(vec) > EMBEDDING_DIM:
-                vec = vec[:EMBEDDING_DIM]
-            elif len(vec) < EMBEDDING_DIM:
-                vec = vec + [0.0] * (EMBEDDING_DIM - len(vec))
-            all_vectors.append(vec)
-        else:
+        response = w.serving_endpoints.query(name=endpoint, input=text)
+        if not (hasattr(response, "data") and response.data):
             raise RuntimeError(
                 f"Databricks embedding endpoint '{endpoint}' returned no data. "
                 "Check that the endpoint exists and is running."
             )
+        vec = list(response.data[0].embedding or [])
+        if len(vec) != EMBEDDING_DIM:
+            raise RuntimeError(
+                f"Endpoint '{endpoint}' returned {len(vec)}-dim vectors but the "
+                f"stored embeddings are {EMBEDDING_DIM}-dim. Set EMBEDDING_MODEL / "
+                f"DATABRICKS_EMBEDDING_ENDPOINT so ingestion and search use the "
+                f"same model, then re-run the embedding notebook."
+            )
+        all_vectors.append(vec)
 
     return all_vectors
+
+
+def describe_backend() -> dict:
+    """Report which embedding backend will be used, for /diagnostics."""
+    if _can_use_local():
+        return {
+            "backend": "sentence-transformers (local)",
+            "model": EMBEDDING_MODEL_NAME,
+            "dim": EMBEDDING_DIM,
+            "matches_ingestion": True,
+        }
+    return {
+        "backend": "databricks foundation model",
+        "endpoint": FOUNDATION_EMBEDDING_ENDPOINT,
+        "dim": EMBEDDING_DIM,
+        "matches_ingestion": FOUNDATION_EMBEDDING_ENDPOINT == EMBEDDING_MODEL_NAME,
+        "note": (
+            "Search results are only meaningful if the notebook embedded documents "
+            "with this same endpoint."
+        ),
+    }
 
 
 def embed_query(query: str) -> list[float]:

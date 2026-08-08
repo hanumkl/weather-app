@@ -126,6 +126,20 @@ def diagnostics():
     except Exception as exc:  # noqa: BLE001
         info["error"] = f"Could not list serving endpoints: {exc}"
 
+    # Which backend will embed search queries, and does it match ingestion?
+    from embeddings import EMBEDDING_DIM, EMBEDDING_MODEL_NAME, describe_backend
+
+    info["embedding"] = describe_backend()
+    info["ingestion_model"] = EMBEDDING_MODEL_NAME
+    info["ingestion_dim"] = EMBEDDING_DIM
+
+    # Actually try the chat endpoint so failures aren't silent
+    try:
+        reply = query_chat_endpoint(configured_llm, "Reply with the single word: ok")
+        info["llm_query_test"] = {"ok": True, "reply": reply[:100]}
+    except Exception as exc:  # noqa: BLE001
+        info["llm_query_test"] = {"ok": False, "error": str(exc)}
+
     return jsonify(info)
 
 
@@ -369,6 +383,38 @@ def _upsert_weather_documents(docs: list[dict]) -> int:
     return count
 
 
+def query_chat_endpoint(endpoint: str, prompt: str) -> str:
+    """
+    Call a Databricks chat serving endpoint and return the text response.
+
+    The SDK expects ChatMessage objects here, not plain dicts — passing dicts
+    fails during serialization.
+    """
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+
+    w = WorkspaceClient()
+    response = w.serving_endpoints.query(
+        name=endpoint,
+        messages=[
+            ChatMessage(
+                role=ChatMessageRole.SYSTEM,
+                content="Answer briefly using only the provided context.",
+            ),
+            ChatMessage(role=ChatMessageRole.USER, content=prompt),
+        ],
+        max_tokens=300,
+        temperature=0.2,
+    )
+
+    if response.choices:
+        message = response.choices[0].message
+        if message is not None and message.content:
+            return str(message.content).strip()
+
+    raise RuntimeError(f"Endpoint {endpoint!r} returned no message content")
+
+
 def _summarize_results(query: str, results: list[dict]) -> str:
     """
     RAG summary: Databricks Foundation Model when available, extractive fallback otherwise.
@@ -397,35 +443,7 @@ def _summarize_results(query: str, results: list[dict]) -> str:
         "DATABRICKS_LLM_ENDPOINT", "databricks-meta-llama-3-3-70b-instruct"
     )
     try:
-        from databricks.sdk import WorkspaceClient
-
-        w = WorkspaceClient()
-        response = w.serving_endpoints.query(
-            name=endpoint,
-            messages=[
-                {"role": "system", "content": "Answer briefly using only the provided context."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=300,
-            temperature=0.2,
-        )
-        if hasattr(response, "choices") and response.choices:
-            choice = response.choices[0]
-            msg = getattr(choice, "message", None)
-            if msg is not None:
-                content = getattr(msg, "content", None) or (msg.get("content") if isinstance(msg, dict) else None)
-                if content:
-                    return str(content).strip()
-            text = getattr(choice, "text", None)
-            if text:
-                return str(text).strip()
-        if hasattr(response, "as_dict"):
-            data = response.as_dict()
-            choices = data.get("choices") or []
-            if choices:
-                msg = choices[0].get("message") or {}
-                if msg.get("content"):
-                    return str(msg["content"]).strip()
+        return query_chat_endpoint(endpoint, prompt)
     except Exception as exc:  # noqa: BLE001
         logger.warning("LLM summary unavailable (%s); using extractive fallback", exc)
 

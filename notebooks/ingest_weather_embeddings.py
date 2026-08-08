@@ -61,6 +61,9 @@ dbutils.widgets.text("embedding_endpoint", "databricks-gte-large-en", "Embedding
 dbutils.widgets.text("chunk_size", "800", "Chunk size (chars)")
 dbutils.widgets.text("chunk_overlap", "100", "Chunk overlap (chars)")
 dbutils.widgets.text("request_batch", "16", "Strings per embedding request")
+dbutils.widgets.text("max_workers", "8", "Parallel embedding requests")
+dbutils.widgets.text("request_timeout", "30", "Per-request timeout (seconds)")
+dbutils.widgets.text("max_documents", "0", "Cap documents per run (0 = no cap)")
 dbutils.widgets.dropdown("rebuild_all", "false", ["false", "true"], "Re-embed everything")
 
 DOCUMENTS_TABLE = dbutils.widgets.get("documents_table")
@@ -69,6 +72,9 @@ EMBEDDING_ENDPOINT = dbutils.widgets.get("embedding_endpoint")
 CHUNK_SIZE = int(dbutils.widgets.get("chunk_size"))
 CHUNK_OVERLAP = int(dbutils.widgets.get("chunk_overlap"))
 REQUEST_BATCH = int(dbutils.widgets.get("request_batch"))
+MAX_WORKERS = int(dbutils.widgets.get("max_workers"))
+REQUEST_TIMEOUT = int(dbutils.widgets.get("request_timeout"))
+MAX_DOCUMENTS = int(dbutils.widgets.get("max_documents"))
 REBUILD_ALL = dbutils.widgets.get("rebuild_all") == "true"
 
 # Known output sizes for Databricks Foundation Model embedding endpoints
@@ -86,7 +92,8 @@ if EMBEDDING_DIM is None:
 print(f"Endpoint: {EMBEDDING_ENDPOINT} -> {EMBEDDING_DIM}-dim vectors")
 print(f"Chunking: size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}")
 print(f"Tables: {DOCUMENTS_TABLE} -> {EMBEDDINGS_TABLE}")
-print(f"Rebuild all: {REBUILD_ALL}")
+print(f"Requests: batch={REQUEST_BATCH}, workers={MAX_WORKERS}, timeout={REQUEST_TIMEOUT}s")
+print(f"Rebuild all: {REBUILD_ALL}, max_documents: {MAX_DOCUMENTS or 'no cap'}")
 
 # COMMAND ----------
 
@@ -266,6 +273,11 @@ else:
         ORDER BY d.synced_at DESC
     """)
 
+if MAX_DOCUMENTS > 0 and len(docs) > MAX_DOCUMENTS:
+    print(f"Capping this run at {MAX_DOCUMENTS} of {len(docs)} documents "
+          f"(re-run to continue with the rest).")
+    docs = docs[:MAX_DOCUMENTS]
+
 print(f"Documents to embed: {len(docs)}")
 for d in docs[:3]:
     print(f"  [{d['source_type']}] {d['location']}: {d['headline']}")
@@ -319,35 +331,107 @@ if chunk_rows:
 # MAGIC %md
 # MAGIC ## Compute Embeddings
 # MAGIC
-# MAGIC Batched calls to the Foundation Model endpoint. The Flask app's search
-# MAGIC endpoint calls this same endpoint, so query and document vectors match.
+# MAGIC Calls the endpoint's REST `invocations` API directly rather than through
+# MAGIC `serving_endpoints.query()`. The SDK retries internally for up to 5 minutes
+# MAGIC with no per-request timeout, so one slow call stalls the whole run and the
+# MAGIC cell dies with `TimeoutError: Timed out after 0:05:00`. Here each request
+# MAGIC has an explicit timeout, retries with backoff on 429/5xx, and batches run
+# MAGIC in parallel via `ThreadPoolExecutor`.
 
 # COMMAND ----------
 
-# DBTITLE 1,Embed chunks via serving endpoint
+# DBTITLE 1,Embedding helper (explicit timeout + retry)
+import time
+
+import requests
+
+_host = w.config.host.rstrip("/")
+_invocations_url = f"{_host}/serving-endpoints/{EMBEDDING_ENDPOINT}/invocations"
+
+
+def embed_batch(texts, timeout=REQUEST_TIMEOUT, max_attempts=4):
+    """Embed a list of strings. Retries on throttling / transient server errors."""
+    headers = {**w.config.authenticate(), "Content-Type": "application/json"}
+
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            resp = requests.post(
+                _invocations_url,
+                headers=headers,
+                json={"input": texts},
+                timeout=timeout,
+            )
+            if resp.status_code == 200:
+                data = resp.json().get("data") or []
+                if len(data) != len(texts):
+                    raise RuntimeError(
+                        f"Requested {len(texts)} embeddings, endpoint returned {len(data)}"
+                    )
+                vectors = []
+                for item in data:
+                    vec = item.get("embedding") or []
+                    if len(vec) != EMBEDDING_DIM:
+                        raise RuntimeError(
+                            f"Expected {EMBEDDING_DIM}-dim vectors, got {len(vec)}. "
+                            "Update ENDPOINT_DIMS and the vector(N) column."
+                        )
+                    vectors.append(vec)
+                return vectors
+
+            # 429 = rate limited, 5xx = transient; both worth retrying
+            if resp.status_code == 429 or resp.status_code >= 500:
+                last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            else:
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+        except requests.Timeout:
+            last_error = f"request timed out after {timeout}s"
+        except requests.RequestException as exc:
+            last_error = str(exc)
+
+        if attempt < max_attempts - 1:
+            backoff = 2 ** attempt
+            print(f"    retry {attempt + 1}/{max_attempts - 1} in {backoff}s ({last_error})")
+            time.sleep(backoff)
+
+    raise RuntimeError(f"Embedding failed after {max_attempts} attempts: {last_error}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Smoke test one call (confirms endpoint + latency)
+t0 = time.perf_counter()
+probe = embed_batch(["Sunny with a high near 78."])
+print(f"Single-call latency: {(time.perf_counter() - t0) * 1000:.0f} ms")
+print(f"Returned {len(probe[0])} dims from {EMBEDDING_ENDPOINT}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Embed all chunks in parallel
+from concurrent.futures import ThreadPoolExecutor
+
 if len(chunk_rows) == 0:
     print("No chunks to embed — run POST /weather/sync first!")
     dbutils.notebook.exit("no_data")
 
 texts = [r["chunk_text"] for r in chunk_rows]
-all_embeddings = []
+batches = [texts[i : i + REQUEST_BATCH] for i in range(0, len(texts), REQUEST_BATCH)]
+print(f"Embedding {len(texts)} chunks in {len(batches)} batch(es) "
+      f"across {MAX_WORKERS} worker(s)...")
 
-for i in range(0, len(texts), REQUEST_BATCH):
-    batch = texts[i : i + REQUEST_BATCH]
-    response = w.serving_endpoints.query(name=EMBEDDING_ENDPOINT, input=batch)
-    if not response.data:
-        raise RuntimeError(f"Endpoint {EMBEDDING_ENDPOINT} returned no data")
-    for item in response.data:
-        vec = list(item.embedding or [])
-        if len(vec) != EMBEDDING_DIM:
-            raise RuntimeError(
-                f"Expected {EMBEDDING_DIM}-dim vectors, got {len(vec)}. "
-                "Update ENDPOINT_DIMS and the vector(N) column."
-            )
-        all_embeddings.append(vec)
-    print(f"  Embedded {min(i + REQUEST_BATCH, len(texts))} / {len(texts)} chunks")
+t0 = time.perf_counter()
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    # map preserves input order, so vectors line up with chunk_rows
+    results = list(pool.map(embed_batch, batches))
 
-print(f"Computed {len(all_embeddings)} embeddings ({EMBEDDING_DIM}-dim each)")
+all_embeddings = [vec for batch_vectors in results for vec in batch_vectors]
+elapsed = time.perf_counter() - t0
+
+if len(all_embeddings) != len(chunk_rows):
+    raise RuntimeError(
+        f"Embedding count mismatch: {len(all_embeddings)} vectors for {len(chunk_rows)} chunks"
+    )
+
+print(f"Computed {len(all_embeddings)} embeddings ({EMBEDDING_DIM}-dim) in {elapsed:.1f}s")
 
 # COMMAND ----------
 

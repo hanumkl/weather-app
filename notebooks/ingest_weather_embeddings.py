@@ -171,8 +171,10 @@ def run_query(sql, params=None):
     conn.close()
     return rows
 
-count = run_query(f"SELECT COUNT(*) AS n FROM {DOCUMENTS_TABLE}")[0]["n"]
-print(f"Connection successful! Found {count} rows in {DOCUMENTS_TABLE}")
+# Probe the connection itself, not a table: the CREATE TABLE cell runs later, so
+# querying weather_documents here fails on any database where it doesn't exist yet.
+info = run_query("SELECT current_user AS role, current_database() AS db")[0]
+print(f"Connection successful! Connected as {info['role']} to {info['db']}")
 
 # COMMAND ----------
 
@@ -251,6 +253,17 @@ run_ddl(f"""
 """)
 
 print(f"Tables ready: {DOCUMENTS_TABLE}, {EMBEDDINGS_TABLE} (vector({EMBEDDING_DIM}) + HNSW)")
+
+doc_count = run_query(f"SELECT COUNT(*) AS n FROM {DOCUMENTS_TABLE}")[0]["n"]
+emb_count = run_query(f"SELECT COUNT(*) AS n FROM {EMBEDDINGS_TABLE}")[0]["n"]
+print(f"{DOCUMENTS_TABLE}: {doc_count} rows | {EMBEDDINGS_TABLE}: {emb_count} rows")
+
+if doc_count == 0:
+    print(
+        f"\n{DOCUMENTS_TABLE} is empty — there is nothing to embed yet.\n"
+        "Harvest weather documents first by calling POST /weather/sync on the app, "
+        "then re-run this notebook."
+    )
 
 # COMMAND ----------
 

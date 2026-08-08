@@ -1,0 +1,51 @@
+# Databricks Asset Bundle — weather sync + embed scheduled job
+bundle:
+  name: weather-intelligence
+
+workspace:
+  # Replace with your workspace URL, e.g. https://dbc-xxxx.cloud.databricks.com
+  host: https://<your-workspace-instance>
+
+targets:
+  dev:
+    mode: development
+    default: true
+
+resources:
+  jobs:
+    weather_sync_embed_job:
+      name: weather-sync-embed
+      schedule:
+        quartz_cron_expression: "0 */30 * * * ?"  # every 30 minutes
+        timezone_id: "America/Chicago"
+        pause_status: PAUSED  # flip to UNPAUSED after a successful manual run
+      tasks:
+        - task_key: sync
+          notebook_task:
+            notebook_path: ./notebooks/sync_weather.py
+            base_parameters:
+              locations: "Chicago, IL;Austin, TX;Seattle, WA"
+              limit: "50"
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            num_workers: 0
+            spark_conf:
+              "spark.databricks.cluster.profile": "singleNode"
+              "spark.master": "local[*]"
+            custom_tags:
+              ResourceClass: SingleNode
+        - task_key: embed
+          depends_on:
+            - task_key: sync
+          notebook_task:
+            notebook_path: ./notebooks/ingest_weather_embeddings.py
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "i3.xlarge"
+            num_workers: 0
+            spark_conf:
+              "spark.databricks.cluster.profile": "singleNode"
+              "spark.master": "local[*]"
+            custom_tags:
+              ResourceClass: SingleNode

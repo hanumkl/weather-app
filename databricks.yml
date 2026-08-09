@@ -40,6 +40,8 @@ resources:
             - task_key: sync
           notebook_task:
             notebook_path: ./notebooks/ingest_weather_embeddings.py
+            base_parameters:
+              max_documents: "5"
           new_cluster:
             spark_version: "15.4.x-scala2.12"
             node_type_id: "i3.xlarge"

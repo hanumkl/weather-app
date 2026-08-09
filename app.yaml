@@ -3,6 +3,14 @@ command:
   - "app.py"
 
 env:
+  # Preferred: name the Lakebase instance and let Databricks issue credentials.
+  # MUST match the notebook's lakebase_instance widget, or the app searches a
+  # different database than the one the notebook wrote to.
+  # Run notebooks/list_lakebase_instances to find the name.
+  - name: LAKEBASE_INSTANCE_NAME
+    value: ""
+
+  # Fallback when LAKEBASE_INSTANCE_NAME is blank: a Postgres URL in a secret.
   - name: LAKEBASE_SECRET_SCOPE
     value: "database"
   - name: LAKEBASE_SECRET_KEY

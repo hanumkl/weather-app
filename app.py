@@ -126,6 +126,15 @@ def diagnostics():
     except Exception as exc:  # noqa: BLE001
         info["error"] = f"Could not list serving endpoints: {exc}"
 
+    # Which Lakebase this app reads/writes — compare against the notebook's
+    # lakebase_instance widget when search returns nothing the notebook wrote.
+    info["lakebase"] = lakebase.describe_connection()
+    try:
+        row = lakebase.run_query("SELECT current_user AS role, current_database() AS db")
+        info["lakebase"].update(row[0])
+    except Exception as exc:  # noqa: BLE001
+        info["lakebase"]["error"] = str(exc)
+
     # Embedding config (shared by the notebook and this app)
     from embeddings import describe_backend
 

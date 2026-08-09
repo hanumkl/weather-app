@@ -308,19 +308,28 @@ The app retries only briefly (3 attempts) since a user is waiting on the respons
 
 ## Known Limitations
 
-- **Databricks Free Edition throttles the embedding endpoint.** Foundation Model
-  API limits are published for Enterprise tier only and "vary based on the
-  workspace platform tier"; Free Edition sits well below them. For embedding
-  models the binding limit is **queries per hour**, not tokens or QPS, so the
-  fix is fewer requests rather than slower ones — `request_batch=128` sends this
-  corpus as a single call. When the hourly budget is already spent, no
-  client-side retry can clear it inside a notebook run; re-run once the window
-  rolls. `databricks-bge-large-en` carries a 4x larger QPH allowance and is also
-  1024-dim, so it substitutes into this schema without a migration.
-  Given more time, the durable fix on Free Edition is to drop the pay-per-token
-  dependency entirely: embed locally with `all-MiniLM-L6-v2` (384-dim) in the
-  notebook and serve query embeddings from an ONNX runtime in the app, which
-  removes both the quota and the torch-in-Apps problem.
+- **Free Edition shares one serving quota across chat and embeddings.** Databricks
+  publishes per-model Foundation Model API limits for Enterprise tier only, noting
+  they "vary based on the workspace platform tier." On Free Edition, model serving
+  is a **per-account pool**, so chat completions and embeddings draw from the same
+  budget. Debugging the RAG summary against a 70B chat model exhausted it, and the
+  embedding endpoint then returned `429 REQUEST_LIMIT_EXCEEDED` even though nothing
+  about the embedding path had changed — the failure surfaced far from its cause.
+
+  Two defaults made this much worse and have been changed: `/diagnostics` fired a
+  live chat completion on every page load, and `GET /weather/search` defaulted
+  `summarize=true`, so every browser search cost a 70B query. Both are now opt-in.
+
+  For embedding models the binding limit is **queries per hour**, not tokens or
+  QPS, so throughput comes from fewer requests rather than slower ones —
+  `request_batch=128` sends this whole corpus as a single call. Once the pool is
+  spent, no client-side retry clears it inside a run.
+
+  `notebooks/ingest_weather_embeddings_local.py` removes the dependency entirely:
+  it runs `all-MiniLM-L6-v2` (384-dim) on the cluster, which is also the model the
+  assignment specified. The remaining gap is the app's query embedding — Databricks
+  Apps can't host torch, so the durable fix is an ONNX runtime (e.g. `fastembed`)
+  in the app serving the same MiniLM weights.
 - Static geocode covers ~20 US cities; others need `lat,lon` format.
 - NWS alerts are sparse in calm weather — forecasts keep the corpus populated.
 - Embedding calls go one batch at a time; fine for homework volumes, would want

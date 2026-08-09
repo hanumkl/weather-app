@@ -101,12 +101,7 @@ def diagnostics():
     configured_llm = os.environ.get(
         "DATABRICKS_LLM_ENDPOINT", "databricks-meta-llama-3-3-70b-instruct"
     )
-    info: dict[str, Any] = {
-        "configured_llm_endpoint": configured_llm,
-        "configured_embedding_endpoint": os.environ.get(
-            "DATABRICKS_EMBEDDING_ENDPOINT", "databricks-bge-large-en"
-        ),
-    }
+    info: dict[str, Any] = {"configured_llm_endpoint": configured_llm}
 
     try:
         from databricks.sdk import WorkspaceClient

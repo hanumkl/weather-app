@@ -325,11 +325,26 @@ The app retries only briefly (3 attempts) since a user is waiting on the respons
   `request_batch=128` sends this whole corpus as a single call. Once the pool is
   spent, no client-side retry clears it inside a run.
 
-  `notebooks/ingest_weather_embeddings_local.py` removes the dependency entirely:
-  it runs `all-MiniLM-L6-v2` (384-dim) on the cluster, which is also the model the
-  assignment specified. The remaining gap is the app's query embedding — Databricks
-  Apps can't host torch, so the durable fix is an ONNX runtime (e.g. `fastembed`)
-  in the app serving the same MiniLM weights.
+  **Both sides now run `all-MiniLM-L6-v2` (384-dim) locally**, which is also the
+  model the assignment specified, and no part of the pipeline touches a serving
+  endpoint any more. The notebook
+  (`notebooks/ingest_weather_embeddings_local.py`) uses `sentence-transformers`
+  on the cluster; the Flask app uses `fastembed`, an ONNX Runtime build of the
+  same weights, because Databricks Apps cannot install torch (~2.5GB). fastembed
+  L2-normalizes and sentence-transformers does not, which does not affect ranking
+  — `<=>` is cosine distance and therefore scale-invariant.
+
+  Only the optional RAG summary still calls a Foundation Model endpoint, and it
+  degrades to an extractive fallback when quota is gone. Search itself cannot be
+  taken down by quota exhaustion.
+- **Tables live in the `mealplan-db` Lakebase project, not `weather-db`.** The
+  `database/lakebase-url` secret still points at the instance created for an
+  earlier project, so `POST /weather/sync` and the embedding notebook both write
+  there. It is consistent end to end — app and notebook resolve the same secret,
+  so retrieval works — but the data is in the wrong project. Fixing it means
+  repointing the secret, re-running sync, and re-embedding; deferred rather than
+  attempted against a deadline. Setting `LAKEBASE_INSTANCE_NAME=weather-db` in
+  `app.yaml` and the notebook's `lakebase_instance` widget is the migration path.
 - Static geocode covers ~20 US cities; others need `lat,lon` format.
 - NWS alerts are sparse in calm weather — forecasts keep the corpus populated.
 - Embedding calls go one batch at a time; fine for homework volumes, would want

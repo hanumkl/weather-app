@@ -1,15 +1,22 @@
 """
 Shared embedding + chunking helpers for weather documents.
 
-Embeddings come from a Databricks Foundation Model serving endpoint
-(`databricks-gte-large-en`, 1024-dim) rather than a local
-sentence-transformers model. Rationale:
+Embeddings come from **all-MiniLM-L6-v2 (384-dim)**, run locally via `fastembed`
+(ONNX Runtime). Rationale:
 
-  - Databricks Apps are lightweight containers; torch (~2.5GB) does not
-    install reliably there.
-  - Using one endpoint for BOTH ingestion (notebook) and query embedding
-    (Flask app) guarantees the two sides share a vector space. Mixing models
-    silently produces meaningless cosine scores.
+  - Databricks Free Edition meters model serving as a single per-account pool
+    shared by chat and embedding endpoints. Draining it on chat completions
+    (the RAG summary) makes the embedding endpoint return 429 as well, which
+    takes search down for reasons unrelated to search. Running the model in
+    process removes that coupling entirely.
+  - `fastembed` is ONNX-based, so it needs no torch (~2.5GB), which does not
+    install in a Databricks App container.
+  - It is the model the assignment specified.
+
+The ingestion notebook (`notebooks/ingest_weather_embeddings_local.py`) uses the
+same weights through `sentence-transformers`. fastembed L2-normalizes its output
+and sentence-transformers does not, which does not affect ranking: pgvector's
+`<=>` is cosine distance and therefore scale-invariant.
 
 The dimension MUST match the `vector(N)` column in weather_embeddings.
 """
@@ -18,25 +25,23 @@ from __future__ import annotations
 
 import logging
 import os
-import time
+import threading
 from typing import Sequence
 
 logger = logging.getLogger("weather-app.embeddings")
 
-EMBEDDING_ENDPOINT = os.environ.get(
-    "DATABRICKS_EMBEDDING_ENDPOINT", "databricks-gte-large-en"
+EMBEDDING_MODEL = os.environ.get(
+    "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
 )
-EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "1024"))
+EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
 
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "800"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "100"))
 
-# Max strings per serving-endpoint request
-_REQUEST_BATCH = int(os.environ.get("EMBED_REQUEST_BATCH", "16"))
-# Per-request timeout so a slow endpoint can't hang a web request
-REQUEST_TIMEOUT = int(os.environ.get("EMBED_REQUEST_TIMEOUT", "30"))
-# Keep retries short — a user is waiting on the HTTP response
-_MAX_ATTEMPTS = int(os.environ.get("EMBED_MAX_ATTEMPTS", "3"))
+# Loaded once per process, not per request: the ONNX session is expensive to
+# build and completely reusable across queries.
+_model = None
+_model_lock = threading.Lock()
 
 
 def chunk_text(
@@ -62,79 +67,39 @@ def chunk_text(
     return chunks
 
 
-def embed_texts(texts: Sequence[str], batch_size: int = _REQUEST_BATCH) -> list[list[float]]:
-    """
-    Embed strings via the Databricks Foundation Model endpoint.
+def _get_model():
+    """Return the process-wide embedding model, loading it on first use."""
+    global _model
+    if _model is not None:
+        return _model
 
-    Calls the REST `invocations` API rather than `serving_endpoints.query()`,
-    which retries internally for up to 5 minutes with no per-request timeout —
-    long enough to hang an HTTP request handler.
-    """
+    with _model_lock:
+        # Re-check inside the lock: two requests can race past the check above.
+        if _model is None:
+            from fastembed import TextEmbedding
+
+            logger.info("Loading embedding model %s", EMBEDDING_MODEL)
+            _model = TextEmbedding(model_name=EMBEDDING_MODEL)
+            logger.info("Embedding model ready")
+    return _model
+
+
+def embed_texts(texts: Sequence[str]) -> list[list[float]]:
+    """Embed strings locally. No network calls, no rate limits."""
     items = list(texts)
     if not items:
         return []
 
-    import requests
-    from databricks.sdk import WorkspaceClient
+    vectors = [list(map(float, v)) for v in _get_model().embed(items)]
 
-    w = WorkspaceClient()
-    url = f"{w.config.host.rstrip('/')}/serving-endpoints/{EMBEDDING_ENDPOINT}/invocations"
-    headers = {**w.config.authenticate(), "Content-Type": "application/json"}
-
-    vectors: list[list[float]] = []
-    for start in range(0, len(items), batch_size):
-        batch = items[start : start + batch_size]
-        resp = _post_with_retry(requests, url, headers, batch)
-
-        data = resp.json().get("data") or []
-        if not data:
+    for vec in vectors:
+        if len(vec) != EMBEDDING_DIM:
             raise RuntimeError(
-                f"Embedding endpoint {EMBEDDING_ENDPOINT!r} returned no data. "
-                "Check that it exists and this identity can query it."
+                f"Model {EMBEDDING_MODEL!r} returned {len(vec)}-dim vectors but "
+                f"EMBEDDING_DIM is {EMBEDDING_DIM}. Align EMBEDDING_DIM and the "
+                f"vector(N) column, then re-run the embedding notebook."
             )
-
-        for item in data:
-            vec = list(item.get("embedding") or [])
-            if len(vec) != EMBEDDING_DIM:
-                raise RuntimeError(
-                    f"Endpoint {EMBEDDING_ENDPOINT!r} returned {len(vec)}-dim vectors "
-                    f"but EMBEDDING_DIM is {EMBEDDING_DIM}. Update EMBEDDING_DIM and the "
-                    f"vector(N) column so they agree, then re-run the embedding notebook."
-                )
-            vectors.append(vec)
-
     return vectors
-
-
-def _post_with_retry(requests_mod, url: str, headers: dict, batch: list[str]):
-    """
-    POST to the embedding endpoint, retrying briefly through 429/5xx.
-
-    Pay-per-token endpoints enforce a workspace QPS limit. Retries stay short
-    here (unlike the notebook's long backoff) because a user is waiting on the
-    HTTP response.
-    """
-    last_error = None
-    for attempt in range(_MAX_ATTEMPTS):
-        resp = requests_mod.post(
-            url, headers=headers, json={"input": batch}, timeout=REQUEST_TIMEOUT
-        )
-        if resp.status_code == 200:
-            return resp
-
-        last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
-        retryable = resp.status_code == 429 or resp.status_code >= 500
-        if not retryable or attempt == _MAX_ATTEMPTS - 1:
-            break
-
-        retry_after = resp.headers.get("Retry-After")
-        wait = float(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt
-        logger.warning("Embedding endpoint throttled, retrying in %.1fs", wait)
-        time.sleep(wait)
-
-    raise RuntimeError(
-        f"Embedding endpoint {EMBEDDING_ENDPOINT!r} failed: {last_error}"
-    )
 
 
 def embed_query(query: str) -> list[float]:
@@ -148,23 +113,23 @@ def vector_literal(embedding: Sequence[float]) -> str:
 
 
 def warm_model() -> str:
-    """
-    No local model to load — kept so callers have a single place to verify the
-    endpoint is reachable before serving traffic. Returns the endpoint name.
-    """
-    return EMBEDDING_ENDPOINT
+    """Load the model ahead of serving traffic so the first search isn't slow."""
+    _get_model()
+    return EMBEDDING_MODEL
 
 
 def describe_backend() -> dict:
     """Report the embedding configuration, for /diagnostics."""
     return {
-        "backend": "databricks foundation model",
-        "endpoint": EMBEDDING_ENDPOINT,
+        "backend": "fastembed (ONNX Runtime, in-process)",
+        "model": EMBEDDING_MODEL,
         "dim": EMBEDDING_DIM,
         "chunk_size": CHUNK_SIZE,
         "chunk_overlap": CHUNK_OVERLAP,
+        "loaded": _model is not None,
         "note": (
-            "The embedding notebook uses this same endpoint, so query and document "
-            "vectors share one space."
+            "The ingestion notebook uses the same MiniLM weights via "
+            "sentence-transformers, so query and document vectors share one space. "
+            "No Foundation Model API quota is consumed by search."
         ),
     }

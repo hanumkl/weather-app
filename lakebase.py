@@ -36,8 +36,8 @@ PG_USER = os.environ.get("PGUSER", "").strip()
 
 DOCUMENTS_TABLE = os.environ.get("WEATHER_DOCUMENTS_TABLE", "weather_documents")
 EMBEDDINGS_TABLE = os.environ.get("WEATHER_EMBEDDINGS_TABLE", "weather_embeddings")
-# Must match the embedding endpoint's output size (databricks-gte-large-en = 1024)
-EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "1024"))
+# Must match the embedding model's output size (all-MiniLM-L6-v2 = 384)
+EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "384"))
 
 
 def _lakebase_url() -> str:

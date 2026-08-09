@@ -18,13 +18,13 @@ env:
   - name: NWS_USER_AGENT
     value: "weather-app-bootcamp (student@example.com)"
 
-  # Embedding endpoint used to embed the search query. MUST match the endpoint
-  # the notebook used to embed documents, and EMBEDDING_DIM must match the
-  # vector(N) column in weather_embeddings.
-  - name: DATABRICKS_EMBEDDING_ENDPOINT
-    value: "databricks-gte-large-en"
+  # Query embeddings run in-process via fastembed (ONNX), so no serving quota is
+  # consumed by search. MUST match the model the ingestion notebook used, and
+  # EMBEDDING_DIM must match the vector(N) column in weather_embeddings.
+  - name: EMBEDDING_MODEL
+    value: "sentence-transformers/all-MiniLM-L6-v2"
   - name: EMBEDDING_DIM
-    value: "1024"
+    value: "384"
 
   # Chat model for the GET /weather/search RAG summary.
   # See GET /diagnostics for names this app can actually query.

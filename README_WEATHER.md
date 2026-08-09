@@ -308,6 +308,19 @@ The app retries only briefly (3 attempts) since a user is waiting on the respons
 
 ## Known Limitations
 
+- **Databricks Free Edition throttles the embedding endpoint.** Foundation Model
+  API limits are published for Enterprise tier only and "vary based on the
+  workspace platform tier"; Free Edition sits well below them. For embedding
+  models the binding limit is **queries per hour**, not tokens or QPS, so the
+  fix is fewer requests rather than slower ones — `request_batch=128` sends this
+  corpus as a single call. When the hourly budget is already spent, no
+  client-side retry can clear it inside a notebook run; re-run once the window
+  rolls. `databricks-bge-large-en` carries a 4x larger QPH allowance and is also
+  1024-dim, so it substitutes into this schema without a migration.
+  Given more time, the durable fix on Free Edition is to drop the pay-per-token
+  dependency entirely: embed locally with `all-MiniLM-L6-v2` (384-dim) in the
+  notebook and serve query embeddings from an ONNX runtime in the app, which
+  removes both the quota and the torch-in-Apps problem.
 - Static geocode covers ~20 US cities; others need `lat,lon` format.
 - NWS alerts are sparse in calm weather — forecasts keep the corpus populated.
 - Embedding calls go one batch at a time; fine for homework volumes, would want

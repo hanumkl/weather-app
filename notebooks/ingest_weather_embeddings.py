@@ -42,7 +42,8 @@
 # COMMAND ----------
 
 # DBTITLE 1,Install SDK
-# MAGIC %pip install -q 'databricks-sdk>=0.30.0'
+# MAGIC # >=0.61.0 for the w.database Lakebase credential API
+# MAGIC %pip install -q 'databricks-sdk>=0.61.0'
 
 # COMMAND ----------
 
@@ -55,6 +56,7 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
+dbutils.widgets.text("lakebase_instance", "", "Lakebase instance (blank = use URL secret)")
 dbutils.widgets.text("documents_table", "weather_documents", "Source table (raw docs)")
 dbutils.widgets.text("embeddings_table", "weather_embeddings", "Destination table (vectors)")
 dbutils.widgets.text("embedding_endpoint", "databricks-gte-large-en", "Embedding endpoint")
@@ -107,35 +109,54 @@ print(f"Rebuild all: {REBUILD_ALL}, max_documents: {MAX_DOCUMENTS or 'no cap'}")
 # MAGIC %md
 # MAGIC ## Resolve Lakebase Connection
 # MAGIC
-# MAGIC Same secret as `lakebase.py` in the Flask app: a base64-encoded Postgres URL
-# MAGIC stored in Databricks scope `database`, key `lakebase-url`.
+# MAGIC Set the `lakebase_instance` widget to the instance this project owns, and
+# MAGIC set `LAKEBASE_INSTANCE_NAME` in `app.yaml` to the **same** name. If they
+# MAGIC differ, the app searches a different database than this notebook writes to.
+# MAGIC Run `list_lakebase_instances` if you're not sure which one to use.
+# MAGIC
+# MAGIC Connecting this way uses your own Databricks identity with a short-lived
+# MAGIC credential, so no password is stored anywhere. Leave the widget blank to
+# MAGIC fall back to the old `database/lakebase-url` secret.
 
 # COMMAND ----------
 
-# DBTITLE 1,Parse Lakebase connection info
+# DBTITLE 1,Resolve Lakebase connection info
 import base64
+import uuid
 from urllib.parse import urlparse
 
 from databricks.sdk import WorkspaceClient
 
 w = WorkspaceClient()
 
-def get_lakebase_url() -> str:
+LAKEBASE_INSTANCE = dbutils.widgets.get("lakebase_instance").strip()
+
+if LAKEBASE_INSTANCE:
+    instance = w.database.get_database_instance(name=LAKEBASE_INSTANCE)
+    db_host = instance.read_write_dns
+    db_port = 5432
+    db_name = "databricks_postgres"
+    db_user = w.current_user.me().user_name
+    db_password = None  # minted per connection below
+
+    print(f"Instance: {LAKEBASE_INSTANCE}")
+    print(f"Host: {db_host}:{db_port}")
+    print(f"Database: {db_name}")
+    print(f"User: {db_user} (your Databricks identity)")
+else:
     secret = w.secrets.get_secret(scope="database", key="lakebase-url")
-    return base64.b64decode(secret.value).decode("utf-8")
+    parsed = urlparse(base64.b64decode(secret.value).decode("utf-8"))
 
-lakebase_url = get_lakebase_url()
-parsed = urlparse(lakebase_url)
+    db_host = parsed.hostname
+    db_port = parsed.port or 5432
+    db_name = parsed.path.lstrip("/")
+    db_user = parsed.username
+    db_password = parsed.password
 
-db_host = parsed.hostname
-db_port = parsed.port or 5432
-db_name = parsed.path.lstrip("/")
-db_user = parsed.username
-db_password = parsed.password
-
-print(f"Host: {db_host}:{db_port}")
-print(f"Database: {db_name}")
-print(f"User: {db_user}")
+    print("Using the database/lakebase-url secret (no lakebase_instance set)")
+    print(f"Host: {db_host}:{db_port}")
+    print(f"Database: {db_name}")
+    print(f"User: {db_user}")
 
 # COMMAND ----------
 
@@ -144,14 +165,22 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 def get_conn():
+    # Lakebase credentials expire after an hour, so mint one per connection
+    # rather than reusing a token captured when the notebook started.
+    password = db_password
+    if LAKEBASE_INSTANCE:
+        password = w.database.generate_database_credential(
+            request_id=str(uuid.uuid4()), instance_names=[LAKEBASE_INSTANCE]
+        ).token
+
     return psycopg2.connect(
         host=db_host,
         port=db_port,
         dbname=db_name,
         user=db_user,
-        password=db_password,
+        password=password,
         sslmode="require",
-        connect_timeout=10,
+        connect_timeout=15,
     )
 
 def run_ddl(sql, params=None):
@@ -171,8 +200,10 @@ def run_query(sql, params=None):
     conn.close()
     return rows
 
-count = run_query(f"SELECT COUNT(*) AS n FROM {DOCUMENTS_TABLE}")[0]["n"]
-print(f"Connection successful! Found {count} rows in {DOCUMENTS_TABLE}")
+# Probe the connection itself, not a table: the CREATE TABLE cell runs later, so
+# querying weather_documents here fails on any database where it doesn't exist yet.
+info = run_query("SELECT current_user AS role, current_database() AS db")[0]
+print(f"Connection successful! Connected as {info['role']} to {info['db']}")
 
 # COMMAND ----------
 
@@ -251,6 +282,17 @@ run_ddl(f"""
 """)
 
 print(f"Tables ready: {DOCUMENTS_TABLE}, {EMBEDDINGS_TABLE} (vector({EMBEDDING_DIM}) + HNSW)")
+
+doc_count = run_query(f"SELECT COUNT(*) AS n FROM {DOCUMENTS_TABLE}")[0]["n"]
+emb_count = run_query(f"SELECT COUNT(*) AS n FROM {EMBEDDINGS_TABLE}")[0]["n"]
+print(f"{DOCUMENTS_TABLE}: {doc_count} rows | {EMBEDDINGS_TABLE}: {emb_count} rows")
+
+if doc_count == 0:
+    print(
+        f"\n{DOCUMENTS_TABLE} is empty — there is nothing to embed yet.\n"
+        "Harvest weather documents first by calling POST /weather/sync on the app, "
+        "then re-run this notebook."
+    )
 
 # COMMAND ----------
 

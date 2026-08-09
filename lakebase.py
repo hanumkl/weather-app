@@ -1,11 +1,14 @@
 """
 Lakebase (Databricks-managed Postgres) connection helper.
 
-Connects using LAKEBASE_URL resolved from a Databricks secret scope
-(scope=database, key=lakebase-url) via the Databricks SDK. The secret
-is a base64-encoded Postgres connection URL created by setup_secrets.py.
+Two ways to connect, tried in order:
 
-For local dev, set LAKEBASE_URL in .env as a fallback.
+1. LAKEBASE_INSTANCE_NAME — connect to a named Lakebase instance as this
+   Databricks identity, using a short-lived credential minted per connection.
+   Preferred: no stored password, and the app and notebook can be pointed at the
+   same instance by name.
+2. A Postgres URL from the Databricks secret scope (database/lakebase-url), or
+   LAKEBASE_URL for local dev. Kept for setups using native Postgres roles.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import uuid
 from contextlib import contextmanager
 from typing import Any, Iterator
 
@@ -23,6 +27,12 @@ logger = logging.getLogger("weather-app.lakebase")
 
 _SCOPE = os.environ.get("LAKEBASE_SECRET_SCOPE", "database")
 _KEY = os.environ.get("LAKEBASE_SECRET_KEY", "lakebase-url")
+
+# Preferred connection path: name the instance and let Databricks issue credentials
+INSTANCE_NAME = os.environ.get("LAKEBASE_INSTANCE_NAME", "").strip()
+PG_DATABASE = os.environ.get("PGDATABASE", "databricks_postgres")
+# Defaults to this identity's Postgres role (a service principal's app id when deployed)
+PG_USER = os.environ.get("PGUSER", "").strip()
 
 DOCUMENTS_TABLE = os.environ.get("WEATHER_DOCUMENTS_TABLE", "weather_documents")
 EMBEDDINGS_TABLE = os.environ.get("WEATHER_EMBEDDINGS_TABLE", "weather_embeddings")
@@ -62,10 +72,48 @@ def _lakebase_url() -> str:
     )
 
 
+def _connect_via_instance() -> Any:
+    """
+    Connect to a named Lakebase instance as this Databricks identity.
+
+    The credential is minted per connection because it expires after an hour;
+    generating it here means long-lived app processes never hold a stale one.
+    """
+    from databricks.sdk import WorkspaceClient
+
+    w = WorkspaceClient()
+    instance = w.database.get_database_instance(name=INSTANCE_NAME)
+    credential = w.database.generate_database_credential(
+        request_id=str(uuid.uuid4()), instance_names=[INSTANCE_NAME]
+    )
+    user = PG_USER or w.current_user.me().user_name
+
+    return psycopg2.connect(
+        host=instance.read_write_dns,
+        port=5432,
+        dbname=PG_DATABASE,
+        user=user,
+        password=credential.token,
+        sslmode="require",
+        connect_timeout=15,
+        cursor_factory=RealDictCursor,
+    )
+
+
+def describe_connection() -> dict:
+    """How this process reaches Lakebase — surfaced by /diagnostics."""
+    if INSTANCE_NAME:
+        return {"mode": "instance", "instance": INSTANCE_NAME, "database": PG_DATABASE}
+    return {"mode": "url_secret", "scope": _SCOPE, "key": _KEY}
+
+
 @contextmanager
 def get_connection() -> Iterator[Any]:
     """Yield a raw psycopg2 connection with a RealDictCursor factory."""
-    conn = psycopg2.connect(_lakebase_url(), cursor_factory=RealDictCursor)
+    if INSTANCE_NAME:
+        conn = _connect_via_instance()
+    else:
+        conn = psycopg2.connect(_lakebase_url(), cursor_factory=RealDictCursor)
     try:
         yield conn
     finally:

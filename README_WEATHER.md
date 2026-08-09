@@ -106,20 +106,51 @@ databricks.yml                          # Asset Bundle: scheduled sync+embed job
 
 1. In your Databricks workspace → **Catalog** → **Lakebase** tab.
 2. Click **Create Lakebase instance**, give it a name, wait for **Available**.
-3. Go to **Roles & Databases** → enable **native password** auth.
-4. **Create a new role** with password auth. Copy the connection URL:
-   ```
-   postgresql://role:password@host:5432/databricks_postgres?sslmode=require
-   ```
+3. Note the instance **name** — that name is the only thing you need to configure.
 
-### 2. Store the secret
+### 2. Point the app and notebook at that instance
 
-1. Open or create a notebook in your Databricks workspace.
-2. Run in a cell:
-   ```python
-   %sh python setup_secrets.py
-   ```
-   Paste the Lakebase URL when prompted. This stores it as `database/lakebase-url`.
+Both connect as **your Databricks identity** using a credential minted per
+connection, so no password is stored anywhere. Set the same instance name in
+both places:
+
+| Where | Setting |
+|---|---|
+| `app.yaml` | `LAKEBASE_INSTANCE_NAME` (then redeploy) |
+| `ingest_weather_embeddings` | the `lakebase_instance` widget |
+
+**These must match.** If they differ, the notebook writes embeddings to one
+database while the app searches another, and `/weather/search` quietly returns
+nothing. `GET /diagnostics` reports the instance, role and database the app is
+actually using — check it there.
+
+Not sure which instance to use? Run `notebooks/list_lakebase_instances`. It
+lists every instance you can see and reports how many `weather_documents` and
+`weather_embeddings` rows each already holds, so you can spot the one your
+earlier sync wrote to.
+
+Your Databricks identity needs a Postgres role on the instance; create one from
+the instance's **Permissions** tab if `list_lakebase_instances` reports
+`cannot inspect`.
+
+<details>
+<summary>Alternative: a native Postgres role with a password</summary>
+
+Leave `LAKEBASE_INSTANCE_NAME` blank to fall back to a stored connection URL.
+Enable **native password** auth under **Roles & Databases**, create a role, then
+store the URL as the `database/lakebase-url` secret:
+
+```python
+%sh python setup_secrets.py
+```
+
+```
+postgresql://role:password@host:5432/databricks_postgres?sslmode=require
+```
+
+Note that a role switch also needs `ALTER TABLE ... OWNER TO "<role>"`, run as
+the previous owner, or the new role gets permission errors on existing tables.
+</details>
 
 ### 3. Create a Git folder
 
@@ -232,6 +263,9 @@ Or create the job manually via **Workflows UI** → **Create Job** with two note
 | RAG summary looks templated | The LLM call failed and fell back to extractive. Check `GET /diagnostics` → `llm_query_test` |
 | All similarity scores in a narrow band | Query and documents were embedded by different models — re-run the notebook |
 | Notebook: `TimeoutError: Timed out after 0:05:00` | `serving_endpoints.query()` retries internally for 5 min with no per-request timeout. Both notebook and app now call the REST `invocations` API with an explicit timeout |
+| `UndefinedTable: relation "weather_documents" does not exist` | The tables live in a different Lakebase instance, or none has been created yet. Confirm the app and notebook use the same `LAKEBASE_INSTANCE_NAME` / `lakebase_instance`, then run `POST /weather/sync` |
+| Search returns nothing the notebook clearly wrote | App and notebook are pointed at different Lakebase instances. Compare `GET /diagnostics` against the notebook's `lakebase_instance` widget |
+| `permission denied for table weather_documents` | The connecting Postgres role is not the table owner. Changing the role in `database/lakebase-url` requires `ALTER TABLE ... OWNER TO "<role>"` first, run as the **old** owner. Ownership (not just `GRANT ALL`) is needed because the ingest notebook may drop and recreate the embeddings table during a dimension migration |
 | `429 REQUEST_LIMIT_EXCEEDED` | Shared workspace request budget for pay-per-token endpoints is saturated. Runs are resumable, so re-run to continue; or switch `embedding_endpoint`. See below |
 | Fix pushed to git but notebook behaves the same | Databricks runs its own copy. Pull in the Git folder, then `dbutils.widgets.removeAll()` + re-run cell 1, since **widget values persist and ignore new code defaults**. Check the `Code version:` line to confirm |
 
@@ -274,6 +308,28 @@ The app retries only briefly (3 attempts) since a user is waiting on the respons
 
 ## Known Limitations
 
+- **Free Edition shares one serving quota across chat and embeddings.** Databricks
+  publishes per-model Foundation Model API limits for Enterprise tier only, noting
+  they "vary based on the workspace platform tier." On Free Edition, model serving
+  is a **per-account pool**, so chat completions and embeddings draw from the same
+  budget. Debugging the RAG summary against a 70B chat model exhausted it, and the
+  embedding endpoint then returned `429 REQUEST_LIMIT_EXCEEDED` even though nothing
+  about the embedding path had changed — the failure surfaced far from its cause.
+
+  Two defaults made this much worse and have been changed: `/diagnostics` fired a
+  live chat completion on every page load, and `GET /weather/search` defaulted
+  `summarize=true`, so every browser search cost a 70B query. Both are now opt-in.
+
+  For embedding models the binding limit is **queries per hour**, not tokens or
+  QPS, so throughput comes from fewer requests rather than slower ones —
+  `request_batch=128` sends this whole corpus as a single call. Once the pool is
+  spent, no client-side retry clears it inside a run.
+
+  `notebooks/ingest_weather_embeddings_local.py` removes the dependency entirely:
+  it runs `all-MiniLM-L6-v2` (384-dim) on the cluster, which is also the model the
+  assignment specified. The remaining gap is the app's query embedding — Databricks
+  Apps can't host torch, so the durable fix is an ONNX runtime (e.g. `fastembed`)
+  in the app serving the same MiniLM weights.
 - Static geocode covers ~20 US cities; others need `lat,lon` format.
 - NWS alerts are sparse in calm weather — forecasts keep the corpus populated.
 - Embedding calls go one batch at a time; fine for homework volumes, would want

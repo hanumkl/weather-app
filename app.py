@@ -126,6 +126,15 @@ def diagnostics():
     except Exception as exc:  # noqa: BLE001
         info["error"] = f"Could not list serving endpoints: {exc}"
 
+    # Which Lakebase this app reads/writes — compare against the notebook's
+    # lakebase_instance widget when search returns nothing the notebook wrote.
+    info["lakebase"] = lakebase.describe_connection()
+    try:
+        row = lakebase.run_query("SELECT current_user AS role, current_database() AS db")
+        info["lakebase"].update(row[0])
+    except Exception as exc:  # noqa: BLE001
+        info["lakebase"]["error"] = str(exc)
+
     # Embedding config (shared by the notebook and this app)
     from embeddings import describe_backend
 
@@ -147,12 +156,18 @@ def diagnostics():
     except Exception as exc:  # noqa: BLE001
         info["embedding"]["table_vector_dim_error"] = str(exc)
 
-    # Actually try the chat endpoint so failures aren't silent
-    try:
-        reply = query_chat_endpoint(configured_llm, "Reply with the single word: ok")
-        info["llm_query_test"] = {"ok": True, "reply": reply[:100]}
-    except Exception as exc:  # noqa: BLE001
-        info["llm_query_test"] = {"ok": False, "error": str(exc)}
+    # Opt-in: this fires a real chat completion, and on Free Edition the model
+    # serving quota is one per-account pool shared with the embedding endpoint.
+    # Left on by default, refreshing /diagnostics silently drains the same budget
+    # the embedding notebook needs. Request it explicitly with ?test_llm=true.
+    if str(request.args.get("test_llm", "false")).lower() in ("1", "true", "yes"):
+        try:
+            reply = query_chat_endpoint(configured_llm, "Reply with the single word: ok")
+            info["llm_query_test"] = {"ok": True, "reply": reply[:100]}
+        except Exception as exc:  # noqa: BLE001
+            info["llm_query_test"] = {"ok": False, "error": str(exc)}
+    else:
+        info["llm_query_test"] = "skipped (add ?test_llm=true — consumes serving quota)"
 
     return jsonify(info)
 
@@ -248,7 +263,10 @@ def search_weather_get():
     query = request.args.get("query")
     top_k = request.args.get("top_k", 5)
     source_type = request.args.get("source_type")
-    summarize = str(request.args.get("summarize", "true")).lower() in (
+    # Defaults to off: each summary is a chat completion against a 70B model, and
+    # on Free Edition that draws from the same per-account serving quota as the
+    # embedding endpoint. Opt in with ?summarize=true.
+    summarize = str(request.args.get("summarize", "false")).lower() in (
         "1",
         "true",
         "yes",

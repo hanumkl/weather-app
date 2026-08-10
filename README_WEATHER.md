@@ -43,7 +43,7 @@ Geocoding uses a **static city → lat/lon map** (20 major US cities) so demos s
 | `document_id` | TEXT FK | References `weather_documents.id` |
 | `chunk_index` | INT | Chunk position in document |
 | `chunk_text` | TEXT | The chunked text |
-| `embedding` | vector(1024) | 1024-dim embedding vector |
+| `embedding` | vector(384) | 384-dim embedding vector |
 | `model_name` | TEXT | Model provenance |
 | `created_at` | TIMESTAMPTZ | When embedded |
 
@@ -53,29 +53,37 @@ Geocoding uses a **static city → lat/lon map** (20 major US cities) so demos s
 
 **Upserts:** `ON CONFLICT (id) DO UPDATE` — re-running sync never duplicates rows.
 
-### Embedding model: `databricks-gte-large-en` (1024-dim), not MiniLM
+### Embedding model: `all-MiniLM-L6-v2` (384-dim), run locally on both sides
 
-The assignment suggests `sentence-transformers/all-MiniLM-L6-v2` (384-dim) but allows a
-different model if the dimensionality is documented. This project uses the Databricks
-Foundation Model endpoint **`databricks-gte-large-en` → 1024 dimensions** for both
-ingestion and query embedding.
+The assignment's suggested model, at its native 384 dimensions. Both sides run the
+same weights **in-process**, with no serving endpoint anywhere in the path:
 
-Why:
+| Side | Runtime | Why |
+|---|---|---|
+| Ingestion notebook | `sentence-transformers` on the cluster | Clusters have torch preinstalled |
+| Flask app (query) | `fastembed` (ONNX Runtime) | Databricks Apps cannot install torch (~2.5GB) |
 
-1. **Both sides must share one vector space.** The Flask app embeds the incoming search
-   query; the notebook embeds the documents. If those use different models, cosine
-   similarity compares unrelated vector spaces and the ranking is meaningless. An earlier
-   version of this project hit exactly that bug — MiniLM documents scored against a
-   truncated BGE query vector produced results clustered in a meaningless 37–39% band.
-2. **Databricks Apps can't host torch.** Apps are lightweight containers; `torch` is
-   ~2.5GB and fails to install, so the app cannot run sentence-transformers locally. A
-   shared serving endpoint is reachable from both the app and the cluster.
-3. **No model download at runtime**, so notebook runs and app cold starts are faster.
+Two constraints drove this, and the project reached it the hard way:
 
-The dimension is configurable via `EMBEDDING_DIM` + `DATABRICKS_EMBEDDING_ENDPOINT`
-(set in `app.yaml` and the notebook widgets). The ingest notebook detects a mismatch
-between the endpoint's output size and the existing `vector(N)` column, then drops and
-recreates the table — stale vectors from a different model are not comparable.
+1. **Both sides must share one vector space.** The app embeds the incoming query;
+   the notebook embeds the documents. Different models mean cosine similarity is
+   comparing unrelated spaces and the ranking is noise. An earlier version hit
+   exactly that — MiniLM documents scored against a truncated BGE query vector
+   produced results clustered in a meaningless 37–39% band.
+2. **Databricks Free Edition meters model serving as one per-account pool** shared
+   between chat and embedding endpoints. An intermediate design used the
+   `databricks-gte-large-en` endpoint (1024-dim) for both sides to guarantee
+   constraint 1, but debugging the RAG summary against a 70B chat model drained
+   the shared pool and took embeddings down with it. Running locally removes the
+   coupling: search cannot be broken by quota spent elsewhere.
+
+fastembed L2-normalizes its output and sentence-transformers does not. This does
+not affect ranking — pgvector's `<=>` is cosine distance, which is scale-invariant.
+
+Dimension is configurable via `EMBEDDING_MODEL` + `EMBEDDING_DIM` in `app.yaml`.
+The ingestion notebook compares the model's output width against the existing
+`vector(N)` column and drops/recreates the table on a mismatch, since vectors from
+different models are not comparable.
 
 ---
 
@@ -86,12 +94,15 @@ app.py                                  # Flask API (Databricks App)
 app.yaml                                # Databricks App deployment config
 lakebase.py                             # Lakebase connection (Databricks secrets)
 weather_client.py                       # NWS API client + static geocode
-embeddings.py                           # Chunking + SentenceTransformer helpers
+embeddings.py                           # Chunking + fastembed (ONNX MiniLM) helpers
 setup_secrets.py                        # One-time: store Lakebase URL as secret
 notebooks/
-  ingest_weather_embeddings.py          # Databricks notebook: embed pipeline
+  ingest_weather_embeddings_local.py    # Embed pipeline (local MiniLM) — USE THIS
+  ingest_weather_embeddings.py          # Embed via serving endpoint — reference only
+  list_lakebase_instances.py            # Databricks notebook: find your instance
   sync_weather.py                       # Databricks notebook: scheduled re-sync
   benchmark_hnsw.py                     # Databricks notebook: HNSW latency test
+screenshots/                            # Pipeline run evidence
 sql/
   01_weather_documents.sql              # DDL (also auto-created by lakebase.py)
   02_weather_embeddings.sql             # DDL with vector(384) + HNSW index
@@ -179,17 +190,23 @@ Expected response: `{"synced": 28, "locations": [...], "documents_fetched": 28}`
 
 ### 6. Run the embedding notebook
 
-1. In your Git folder, open `notebooks/ingest_weather_embeddings.py`.
-2. Attach it to a running cluster.
+1. In your Git folder, open **`notebooks/ingest_weather_embeddings_local.py`**.
+2. Attach it to a cluster.
 3. **Run All** — it will:
    - Uninstall `psycopg2` / `psycopg2-binary` (see note below)
-   - Read unembedded docs from `weather_documents`
-   - Chunk and embed them via `databricks-gte-large-en` (1024-dim)
+   - Read every document from `weather_documents`
+   - Chunk and embed with `all-MiniLM-L6-v2` (384-dim) **on the cluster**
    - Write vectors into `weather_embeddings` via `execute_values` + `::vector`
-   - Verify with a sample similarity query
+   - Verify with a live cosine similarity query
 
-Widgets let you override the endpoint, chunk size/overlap, and set
-`rebuild_all=true` to re-embed every document instead of only new ones.
+Leave `LAKEBASE_INSTANCE = ""` to use the `database/lakebase-url` secret, which
+is the path the deployed app uses; set it only if you point the app at a named
+instance too.
+
+> **Use the `_local` notebook, not `ingest_weather_embeddings.py`.** The latter
+> embeds through the `databricks-gte-large-en` serving endpoint and is kept only
+> to document that approach. On Databricks Free Edition it cannot complete — see
+> Known Limitations for why the serving quota makes it unusable.
 
 > **Why uninstall psycopg2?** The Databricks runtime already ships `psycopg2`.
 > A pip-installed copy alongside it crashes the kernel with
@@ -296,15 +313,11 @@ payloads are split in half automatically.
 embedded, and the document query only selects chunks with no embedding yet, so a
 429 partway through keeps everything already written — just re-run the notebook.
 
-If the budget is exhausted by activity outside your control, no client-side
-tuning helps. Run `notebooks/probe_embedding_endpoints` to see which endpoints
-respond right now — it sends one short request to each and reports status,
-latency and dimensions. Then either wait for capacity, or point
-`embedding_endpoint` at a less contended endpoint. `databricks-bge-large-en` is also 1024-dim, so the schema
-still fits — but set `DATABRICKS_EMBEDDING_ENDPOINT` in `app.yaml` to match and
-re-embed, since queries and documents must share one vector space.
-
-The app retries only briefly (3 attempts) since a user is waiting on the response.
+On Free Edition none of this is sufficient, because the budget is a single
+per-account pool shared with chat endpoints rather than a per-model allowance.
+Both `databricks-gte-large-en` and `databricks-bge-large-en` returned 429 to a
+single 86-chunk request. **That is why the pipeline no longer uses a serving
+endpoint at all** — see Known Limitations.
 
 ## Known Limitations
 
